@@ -11,12 +11,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
+import socket
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
+
+import requests
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -51,6 +56,12 @@ _RE_REDIRECT = re.compile(r"redirecting to: (\S+)")
 _RE_ACCESS_ERROR = re.compile(r"access error: (.+)")
 _PICTURE = "Received first picture"
 _DEAD = ("dead input", "Your input can't be opened", "nothing to play")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def explain_http(code: int) -> str:
@@ -96,6 +107,7 @@ class PlaybackSession(QObject):
         retries: int = 1,
         retry_delay_s: float = 6.0,
         line_was_free: bool | None = None,
+        before_retry: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._url = stream_url
@@ -104,6 +116,9 @@ class PlaybackSession(QObject):
         self._retries = max(0, retries)
         self._retry_delay = retry_delay_s
         self._line_was_free = line_was_free
+        self._before_retry = before_retry
+        self._status = requests.Session()
+        self._status.trust_env = False  # never send localhost polling through a proxy
         self._cancelled = threading.Event()
         self._process: subprocess.Popen | None = None
 
@@ -143,6 +158,12 @@ class PlaybackSession(QObject):
                 self.progress.emit(f"Nouvel essai {attempt}/{attempts} dans {self._retry_delay:.0f} s…")
                 self._log(logging.INFO, f"Nouvel essai {attempt}/{attempts} dans {self._retry_delay:.0f} s")
                 time.sleep(self._retry_delay)
+                if self._before_retry is not None:
+                    try:
+                        self._log(logging.INFO, "Reconnexion à l'API du serveur avant le nouvel essai")
+                        self._before_retry()
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(logging.WARNING, f"Reconnexion à l'API impossible : {exc}")
             last = self._attempt(vlc_path, attempt, attempts)
             if last.ok:
                 self.finished.emit(True, f"{self._title} : lecture en cours")
@@ -163,6 +184,10 @@ class PlaybackSession(QObject):
     def _attempt(self, vlc_path: str, attempt: int, attempts: int) -> AttemptResult:
         self._log_dir.mkdir(parents=True, exist_ok=True)
         log_file = self._log_dir / f"vlc-{int(time.time())}-{attempt}.log"
+        # VLC's own web interface (localhost only) tells us in real time whether it is
+        # playing, because its log file only reaches the disk in blocks on Windows.
+        port = _free_port()
+        password = secrets.token_hex(8)
         cmd = [
             vlc_path,
             "--network-caching=1000",
@@ -175,6 +200,10 @@ class PlaybackSession(QObject):
             "--file-logging",
             f"--logfile={log_file}",
             "--log-verbose=2",
+            "--extraintf=http",
+            "--http-host=127.0.0.1",
+            f"--http-port={port}",
+            f"--http-password={password}",
             self._url,
         ]
         # VLC is a normal windowed app: launch it as-is, no STARTUPINFO tweaks.
@@ -190,11 +219,11 @@ class PlaybackSession(QObject):
 
         self.progress.emit(f"Connexion à {_host(self._url)}… (essai {attempt}/{attempts})")
         self._log(logging.INFO, f"Essai {attempt}/{attempts} : VLC lancé (PID {self._process.pid})")
-        result = self._watch(log_file)
+        result = self._watch(log_file, port, password)
         self._prune_logs()
         return result
 
-    def _watch(self, log_file: Path) -> AttemptResult:
+    def _watch(self, log_file: Path, port: int, password: str) -> AttemptResult:
         """Tail VLC's log until we know for sure, or until the deadline.
 
         Two Windows quirks shape this:
@@ -290,10 +319,51 @@ class PlaybackSession(QObject):
                     return outcome
             return None
 
+        started_at = time.monotonic()
+        seen_active = False
+        sent_play = False
+        status_reachable = False
+        tick = 0
+
+        def failure_from_codes(default: str) -> AttemptResult:
+            if codes and codes[-1] >= 400:
+                code = codes[-1]
+                return AttemptResult(False, f"HTTP {code} — {self._explain(code)}", codes)
+            return AttemptResult(False, default, codes)
+
         while time.monotonic() < deadline and not self._cancelled.is_set():
             outcome = drain()
             if outcome is not None:
                 return outcome
+            tick += 1
+            status = self._poll_status(port, password) if tick % 2 == 0 else None
+            if status is not None:
+                status_reachable = True
+                state = str(status.get("state", ""))
+                stats = status.get("stats") or {}
+                decoded = int(stats.get("decodedvideo", 0) or 0) + int(stats.get("decodedaudio", 0) or 0)
+                if decoded > 0:
+                    drain()
+                    self._log(logging.INFO, "✔ VLC décode le flux, la chaîne tourne")
+                    return AttemptResult(True, "lecture", codes)
+                if state in ("playing", "paused", "opening", "buffering"):
+                    seen_active = True
+                elif state == "stopped":
+                    waited = time.monotonic() - started_at
+                    if not seen_active and not sent_play and waited > 2.5:
+                        # Some VLC setups enqueue without starting: press play for the user.
+                        sent_play = True
+                        self._log(logging.INFO, "VLC n'avait pas démarré la lecture : lecture forcée")
+                        self._command(port, password, "pl_play")
+                    elif seen_active or waited > 12:
+                        # The input died (or never started). Closing VLC flushes its log,
+                        # which gives us the HTTP code the server answered.
+                        self._stop_process()
+                        time.sleep(0.5)
+                        outcome = drain()
+                        if outcome is not None and not outcome.ok:
+                            return outcome
+                        return failure_from_codes("VLC n'a pas réussi à ouvrir le flux (lecture arrêtée)")
             if self._process is not None and self._process.poll() is not None:
                 outcome = drain()  # VLC flushes its log when it exits
                 if outcome is not None and not outcome.ok:
@@ -303,6 +373,8 @@ class PlaybackSession(QObject):
 
         if self._cancelled.is_set():
             return AttemptResult(False, "annulé", codes, idle=True)
+        if not status_reachable:
+            self._log(logging.INFO, "Interface de contrôle de VLC injoignable, verdict basé sur son journal seulement")
         if codes and codes[-1] >= 400:
             code = codes[-1]
             return AttemptResult(False, f"HTTP {code} — {self._explain(code)}", codes)
@@ -321,6 +393,31 @@ class PlaybackSession(QObject):
             )
         return AttemptResult(True, "lecture (non confirmée)", codes)
 
+    def _poll_status(self, port: int, password: str) -> dict | None:
+        try:
+            response = self._status.get(
+                f"http://127.0.0.1:{port}/requests/status.json",
+                auth=("", password),
+                timeout=1.0,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        except (requests.RequestException, ValueError):
+            return None
+
+    def _command(self, port: int, password: str, command: str) -> None:
+        try:
+            self._status.get(
+                f"http://127.0.0.1:{port}/requests/status.json",
+                params={"command": command},
+                auth=("", password),
+                timeout=1.0,
+            )
+        except requests.RequestException:
+            pass
+
     def _explain(self, code: int) -> str:
         if code == 401 and self._line_was_free:
             return "IP probablement bloquée pour le moment (la ligne était libre, ce n'est pas la limite de connexions)"
@@ -331,6 +428,21 @@ class PlaybackSession(QObject):
         if process is None or process.poll() is not None:
             return
         try:
+            if os.name == "nt":
+                # Polite close first (like clicking ✕): VLC then flushes its log to disk,
+                # which a hard kill would lose.
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                try:
+                    process.wait(timeout=4)
+                    return
+                except subprocess.TimeoutExpired:
+                    pass
             process.terminate()
             process.wait(timeout=3)
         except (OSError, subprocess.TimeoutExpired):

@@ -279,6 +279,8 @@ class AppController:
                     LOGGER.warning("Impossible de lire l'état de la ligne : %s", exc)
             return stream_url, line_state
 
+        service = self._service_for(profile)
+
         def launch(payload: tuple[str, str]) -> None:
             stream_url, line_state = payload
             line_was_free: bool | None = None
@@ -305,6 +307,7 @@ class AppController:
                 self._log_dir,
                 retries=self._config.ui.auto_retries,
                 line_was_free=line_was_free,
+                before_retry=lambda: service.fetch_connection_info(profile),
             )
             if self._on_playback_progress is not None:
                 session.progress.connect(self._on_playback_progress)
