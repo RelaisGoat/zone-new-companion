@@ -185,11 +185,13 @@ class M3UService(PortalService):
                     if i + 1 < len(lines):
                         url = lines[i + 1].strip()
                         if url and not url.startswith('#'):
+                            logo_match = re.search(r'tvg-logo="([^"]*)"', line)
                             items.append(MediaItem(
                                 id=f"m3u_{len(items)}",
                                 name=name,
                                 media_kind="live",
                                 item_type="channel",
+                                metadata={"tvg_logo": logo_match.group(1)} if logo_match else {},
                                 stream_url=url
                             ))
             i += 1

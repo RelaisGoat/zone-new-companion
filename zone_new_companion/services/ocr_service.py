@@ -50,7 +50,7 @@ class OCRService:
                     timeout=5
                 )
                 if result.returncode == 0:
-                    logger_service.info(f"Tesseract found at: {cmd}")
+                    logger_service.debug(f"Tesseract found at: {cmd}")
                     return True
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 continue

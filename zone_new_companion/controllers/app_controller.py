@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
@@ -17,7 +18,7 @@ from zone_new_companion.models import Credentials, MediaItem, PlaylistCategory, 
 from zone_new_companion.services.base import PortalService
 from zone_new_companion.services.m3u_service import M3UService
 from zone_new_companion.services.ocr_service import OCRService
-from zone_new_companion.services.player_launcher import launch_stream
+from zone_new_companion.services.playback_monitor import PlaybackSession
 from zone_new_companion.services.stalker_service import StalkerService
 from zone_new_companion.services.stream_verifier import StreamVerifier
 from zone_new_companion.services.xtream_service import XtreamService
@@ -30,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 class AppController:
     """Coordinate UI events, state, and services."""
 
-    def __init__(self, state_store: StateStore, config_store: ConfigStore) -> None:
+    def __init__(self, state_store: StateStore, config_store: ConfigStore, log_dir: Path | None = None) -> None:
         self._state_store = state_store
         self._config_store = config_store
         self._config: AppConfig = config_store.load()
@@ -43,6 +44,9 @@ class AppController:
         self._verifier = StreamVerifier()
         self._ocr_service = OCRService()
         self._navigation_stack: dict[str, list[list[MediaItem]]] = {"Live": [], "Movies": [], "Series": []}
+        self._log_dir = log_dir or (Path.home() / ".zone-new-companion" / "logs")
+        self._session: PlaybackSession | None = None
+        self._on_playback_progress: Callable[[str], None] | None = None
 
     @property
     def config(self) -> AppConfig:
@@ -67,37 +71,37 @@ class AppController:
         """Validate input credentials with comprehensive error checking."""
         try:
             if not credentials.base_url:
-                return "Base URL is required."
+                return "Il manque l'adresse du serveur."
             
             # Validate URL format
             if not credentials.base_url.startswith(('http://', 'https://')):
-                return "Base URL must start with http:// or https://"
+                return "L'adresse doit commencer par http:// ou https://"
             
             if re.search(r"\s", credentials.base_url):
-                return "Base URL must not contain spaces."
+                return "L'adresse ne doit pas contenir d'espaces."
             
             # Portal-specific validation
             if credentials.portal_type == PortalType.XTREAM:
                 if not credentials.username or not credentials.password:
-                    return "Xtream mode requires username and password."
+                    return "Xtream : identifiant et mot de passe requis."
                 if len(credentials.username) < 3:
-                    return "Username must be at least 3 characters long."
+                    return "L'identifiant doit faire au moins 3 caractères."
                     
             elif credentials.portal_type == PortalType.M3U:
                 if not credentials.base_url:
-                    return "M3U mode requires a valid playlist URL."
+                    return "Il manque l'URL de la playlist."
                 # Additional M3U validation
                 if not any(ext in credentials.base_url.lower() for ext in ['.m3u', '.m3u8', 'get.php']):
                     LOGGER.warning("M3U URL doesn't contain typical M3U indicators")
                     
             elif credentials.portal_type == PortalType.STALKER:
                 if not credentials.mac_address:
-                    return "Stalker mode requires MAC address."
+                    return "Stalker : adresse MAC requise."
                 if not re.match(
                     r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$",
                     credentials.mac_address,
                 ):
-                    return "MAC address must match format 00:11:22:33:44:55."
+                    return "Adresse MAC au format 00:11:22:33:44:55."
             
             return None
             
@@ -134,8 +138,7 @@ class AppController:
     def connect(self, credentials: Credentials, on_success: Callable[[str], None], on_error: Callable[[str], None]) -> None:
         """Load categories asynchronously and persist profile."""
         try:
-            logger_service.info(f"Starting connection to {credentials.base_url}")
-            logger_service.debug(f"Portal type: {credentials.portal_type}")
+            LOGGER.info("Connexion à %s (%s)…", credentials.base_url, credentials.portal_type.value)
             
             credentials = self._normalize_credentials(credentials)
             self._config.last_input = credentials
@@ -147,19 +150,16 @@ class AppController:
 
             service = self._service_for(credentials)
             
-            logger_service.info(f"Using service: {service.__class__.__name__}")
             
             self._state_store.update(
                 active_profile=credentials,
                 busy=True,
-                status_text=f"Connecting to {credentials.base_url}",
+                status_text=f"Connexion à {credentials.base_url}…",
             )
 
             def task() -> tuple[dict[str, list[PlaylistCategory]], dict[str, str]]:
-                logger_service.debug("Fetching categories and connection info...")
                 categories = service.fetch_categories(credentials)
                 info = service.fetch_connection_info(credentials)
-                logger_service.info(f"Retrieved {len(categories)} categories")
                 return categories, info
 
             worker = TaskWorker(task)
@@ -168,9 +168,8 @@ class AppController:
             worker.signals.finished.connect(lambda: self._state_store.update(busy=False))
             self._thread_pool.start(worker)
             
-            logger_service.info("Connection task started")
         except Exception as exc:
-            logger_service.error(f"Connection failed: {exc}")
+            LOGGER.error("Connexion impossible : %s", exc)
             on_error(str(exc))
 
     def _on_connected(
@@ -184,9 +183,11 @@ class AppController:
         self._state_store.update(
             categories=categories,
             credential_info=connection_info,
-            status_text="Playlist categories loaded.",
+            status_text="Catégories chargées.",
         )
-        on_success(f"Connected ({credentials.portal_type.value})")
+        total = sum(len(rows) for rows in categories.values())
+        LOGGER.info("Connecté à %s : %d catégories", credentials.base_url, total)
+        on_success(f"Connecté · {total} catégories")
 
     def load_items(
         self,
@@ -199,12 +200,12 @@ class AppController:
         state = self._state_store.state
         profile = state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
         if self._state_store.state.busy:
-            on_error("Another operation is in progress.")
+            on_error("Patiente, une opération est déjà en cours.")
             return
-        self._state_store.update(busy=True, status_text=f"Loading {tab_name} items...")
+        self._state_store.update(busy=True, status_text="Chargement…")
 
         def task() -> list[MediaItem]:
             return self._service_for(profile).fetch_items(profile, category)
@@ -237,35 +238,109 @@ class AppController:
             current_items=current,
             verification_results=verification,
             now_playing=now_playing,
-            status_text=f"{len(items)} items loaded.",
+            status_text=f"{len(items)} éléments chargés.",
         )
-        on_success(f"{tab_name}: {len(items)} entries")
+        LOGGER.info("%s : %d éléments chargés", tab_name, len(items))
 
         # Lightweight "now playing" prefetch for Live tab.
         if tab_name == "Live":
             self._prefetch_now_playing(items[:10])
 
     def play(self, item: MediaItem, on_success: Callable[[str], None], on_error: Callable[[str], None]) -> None:
-        """Resolve stream and launch VLC asynchronously."""
+        """Resolve the stream, then hand it to a monitored VLC session."""
         profile = self._state_store.state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
-        if self._state_store.state.busy:
-            on_error("Another operation is in progress.")
-            return
+        if self._session is not None:
+            self._session.cancel()  # stop watching the previous launch (VLC stays open)
 
-        self._state_store.update(busy=True, status_text=f"Resolving stream for {item.name}")
+        self._state_store.update(status_text=f"Préparation de {item.name}…")
+        LOGGER.info("Lecture demandée : %s", item.name)
 
-        def task() -> str:
-            stream_url = self._service_for(profile).resolve_stream_url(profile, item)
-            launch_stream(stream_url)
-            return stream_url
+        def task() -> tuple[str, str]:
+            service = self._service_for(profile)
+            stream_url = service.resolve_stream_url(profile, item)
+            line_state = ""
+            if profile.portal_type == PortalType.XTREAM:
+                # player_api does not count as a connection: safe to ask before launching.
+                try:
+                    info = service.fetch_connection_info(profile)
+                    line_state = info.get("Active/Max Connections", "")
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Impossible de lire l'état de la ligne : %s", exc)
+            return stream_url, line_state
+
+        def launch(payload: tuple[str, str]) -> None:
+            stream_url, line_state = payload
+            if line_state:
+                active, _, maximum = line_state.partition("/")
+                if active.isdigit() and maximum.isdigit() and int(active) >= int(maximum):
+                    LOGGER.warning(
+                        "Ligne %s déjà pleine (%s) avant lancement : le serveur risque de refuser",
+                        profile.username,
+                        line_state,
+                    )
+                else:
+                    LOGGER.info("Ligne %s : %s connexions avant lancement", profile.username, line_state)
+                info = dict(self._state_store.state.credential_info)
+                if info:
+                    info["Active/Max Connections"] = line_state
+                    self._state_store.update(credential_info=info)
+            session = PlaybackSession(
+                stream_url,
+                item.name,
+                self._log_dir,
+                retries=self._config.ui.auto_retries,
+            )
+            if self._on_playback_progress is not None:
+                session.progress.connect(self._on_playback_progress)
+            session.finished.connect(lambda ok, message: self._on_playback_finished(ok, message, on_success, on_error))
+            self._session = session
+            session.start()
 
         worker = TaskWorker(task)
-        worker.signals.succeeded.connect(lambda _: on_success(f"Playing {item.name}"))
+        worker.signals.succeeded.connect(launch)
         worker.signals.failed.connect(lambda message: self._on_error(message, on_error))
-        worker.signals.finished.connect(lambda: self._state_store.update(busy=False, status_text="Ready"))
+        self._thread_pool.start(worker)
+
+    def _on_playback_finished(
+        self,
+        ok: bool,
+        message: str,
+        on_success: Callable[[str], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        self._state_store.update(status_text=message)
+        if ok:
+            on_success(message)
+        else:
+            on_error(message + " — détails dans le Journal")
+
+    def set_playback_progress_callback(self, callback: Callable[[str], None]) -> None:
+        self._on_playback_progress = callback
+
+    def set_auto_retries(self, retries: int) -> None:
+        self._config.ui.auto_retries = retries
+        self._config_store.save(self._config)
+
+    def refresh_connection_info(self, on_success: Callable[[str], None], on_error: Callable[[str], None]) -> None:
+        profile = self._state_store.state.active_profile
+        if profile is None:
+            return
+
+        def task() -> dict[str, str]:
+            return self._service_for(profile).fetch_connection_info(profile)
+
+        def done(info: dict[str, str]) -> None:
+            self._state_store.update(credential_info=info)
+            cons = info.get("Active/Max Connections", "")
+            LOGGER.info("Infos du compte rafraîchies%s", f" : connexions {cons}" if cons else "")
+            on_success(f"Compte rafraîchi{f' · connexions {cons}' if cons else ''}")
+
+        worker = TaskWorker(task)
+        worker.signals.succeeded.connect(done)
+        worker.signals.failed.connect(lambda message: self._on_error(message, on_error))
         self._thread_pool.start(worker)
 
     def activate_item(
@@ -290,9 +365,9 @@ class AppController:
     ) -> None:
         profile = self._state_store.state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
-        self._state_store.update(busy=True, status_text=f"Loading children for {item.name}")
+        self._state_store.update(busy=True, status_text=f"Ouverture de {item.name}…")
 
         def task() -> list[MediaItem]:
             return self._service_for(profile).fetch_series_children(profile, item)
@@ -317,7 +392,7 @@ class AppController:
         self._state_store.update(
             current_items=current,
             verification_results=verification,
-            status_text="Returned to previous list.",
+            status_text="Retour.",
         )
         return True
 
@@ -330,16 +405,16 @@ class AppController:
         """Verify current tab streams for reachability and A/V."""
         profile = self._state_store.state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
         tab_items = self._state_store.state.current_items.get(tab_name, [])
         if not tab_items:
-            on_error("No loaded items to verify.")
+            on_error("Rien à vérifier dans cette liste.")
             return
         if self._state_store.state.busy:
-            on_error("Another operation is in progress.")
+            on_error("Patiente, une opération est déjà en cours.")
             return
-        self._state_store.update(busy=True, status_text=f"Verifying {len(tab_items)} streams...")
+        self._state_store.update(busy=True, status_text=f"Vérification de {len(tab_items)} flux…")
 
         def task() -> dict[str, str]:
             service = self._service_for(profile)
@@ -354,7 +429,7 @@ class AppController:
                 
                 # Update status text with progress
                 progress_percent = (verified_count / total_count) * 100
-                status_text = f"Verifying {verified_count}/{total_count} ({progress_percent:.1f}%)"
+                status_text = f"Vérification {verified_count}/{total_count} ({progress_percent:.0f} %)"
                 
                 self._state_store.update(
                     verification_results=verification,
@@ -380,14 +455,14 @@ class AppController:
     ) -> None:
         profile = self._state_store.state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
         if item.item_type not in {"channel", "vod", "episode"}:
-            on_error("Item is not a playable stream.")
+            on_error("Cet élément n'est pas un flux lisible.")
             return
 
         self._state_store.update(
-            status_text=f"Priority verifying {item.name}...",
+            status_text=f"Vérification de {item.name}…",
             priority_verification_active=True
         )
 
@@ -416,15 +491,15 @@ class AppController:
         """Verify all channels in the current tab efficiently."""
         profile = self._state_store.state.active_profile
         if profile is None:
-            on_error("No active profile.")
+            on_error("Pas de connexion active.")
             return
 
         items = self._state_store.state.current_items.get(tab_name, [])
         if not items:
-            on_error("No items to verify in this tab.")
+            on_error("Rien à vérifier dans cette liste.")
             return
 
-        self._state_store.update(status_text=f"Verifying all {len(items)} channels in {tab_name}...")
+        self._state_store.update(status_text=f"Vérification de {len(items)} flux…")
 
         def task() -> dict[str, str]:
             service = self._service_for(profile)
@@ -459,7 +534,7 @@ class AppController:
     ) -> None:
         """Cancel all ongoing verification processes."""
         try:
-            logger_service.info("Cancelling all verification processes")
+            LOGGER.info("Annulation des vérifications")
             # Clear verification queue and stop background verification
             self._state_store.update(
                 background_verification_active=False,
@@ -467,8 +542,7 @@ class AppController:
                 priority_verification_active=False,
                 busy=False
             )
-            on_success("All verification processes cancelled.")
-            logger_service.info("Verification processes cancelled successfully")
+            on_success("Vérifications annulées")
         except Exception as e:
             logger_service.error(f"Failed to cancel verification: {e}")
             on_error(f"Failed to cancel verification: {e}")
@@ -530,9 +604,10 @@ class AppController:
         self._state_store.update(
             verification_results=verification,
             persistent_verification_results=persistent_results,
-            status_text=f"Verification done: {ok_count}/{len(results)} reachable.",
+            status_text=f"Vérification : {ok_count}/{len(results)} joignables.",
         )
-        on_success(f"Verification done: {ok_count}/{len(results)}")
+        LOGGER.info("Vérification terminée : %d/%d joignables", ok_count, len(results))
+        on_success(f"Vérification : {ok_count}/{len(results)} OK")
 
     def reset_form(self) -> None:
         """Reset state without losing saved profiles."""
@@ -543,12 +618,12 @@ class AppController:
             verification_results={"Live": {}, "Movies": {}, "Series": {}},
             credential_info={},
             now_playing={"Live": {}, "Movies": {}, "Series": {}},
-            status_text="Form reset.",
+            status_text="Déconnecté.",
         )
         self._navigation_stack = {"Live": [], "Movies": [], "Series": []}
 
     def _remember_success(self, credentials: Credentials) -> None:
-        LOGGER.info("Saving successful connection for %s", credentials.base_url)
+        LOGGER.debug("Connexion mémorisée : %s", credentials.base_url)
         stamped = Credentials(
             name=credentials.name,
             base_url=credentials.base_url,
@@ -572,9 +647,30 @@ class AppController:
         self._config.successful_history = []
         self._config_store.save(self._config)
 
+    @staticmethod
+    def _humanize(message: str) -> str:
+        """Turn raw requests/HTTP errors into something readable."""
+        import re as _re
+
+        code = _re.search(r"\b(4\d\d|5\d\d) (?:Client|Server) Error", message)
+        if code:
+            from zone_new_companion.services.playback_monitor import explain_http
+
+            value = int(code.group(1))
+            return f"Le serveur a répondu HTTP {value} : {explain_http(value)}"
+        lowered = message.lower()
+        if "timed out" in lowered or "timeout" in lowered:
+            return "Le serveur ne répond pas (délai dépassé)."
+        if "name or service not known" in lowered or "getaddrinfo" in lowered or "nameresolution" in lowered:
+            return "Serveur introuvable (adresse inconnue)."
+        if "connection refused" in lowered or "max retries exceeded" in lowered:
+            return "Connexion au serveur impossible."
+        return message
+
     def _on_error(self, message: str, callback: Callable[[str], None]) -> None:
-        LOGGER.error("Operation failed: %s", message)
-        self._state_store.update(status_text=f"Error: {message}")
+        message = self._humanize(message)
+        LOGGER.error("%s", message)
+        self._state_store.update(status_text=f"Erreur : {message}")
         callback(message)
 
     def save_ui_state(self, width: int, height: int) -> None:

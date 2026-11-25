@@ -5,6 +5,22 @@ All notable changes to zone-new-companion will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Non publié] — branche debug-connexions
+
+### Interface
+- Nouvelle interface en français : barre de navigation (Connexion, Chaînes, Films, Séries, Journal), thème sombre maison
+- Page Connexion séparée des listes : coller un lien **ou** saisie manuelle, connexions récentes, fiche compte (statut, expiration, connexions actives/max avec alerte si la ligne est pleine, bouton Rafraîchir)
+- Listes en grand avec logos des chaînes (récupérés depuis l'API, mis en cache), vue liste ou grille, recherche dans les catégories et dans les chaînes
+
+### Connexion par lien
+- Accepte get.php, player_api.php, xmltv.php, liens de chaîne (/live/…, /login/mdp/id), playlists .m3u et portails Stalker ; le serveur, l'identifiant et le mot de passe sont extraits automatiquement (les doubles slashs sont corrigés)
+
+### Diagnostic de lecture
+- VLC est lancé avec son propre journal, lu en direct : codes HTTP réellement reçus (401, 456, 302…), redirections, première image
+- Explication en clair de chaque code et état de la ligne (connexions actives/max) avant le lancement
+- Relance automatique de VLC si le serveur refuse (nombre réglable dans le Journal)
+- Onglet Journal : filtre, recherche, copie, accès au dossier des logs
+
 ## [1.2.2] - 2026-05-09
 
 ### Fixed

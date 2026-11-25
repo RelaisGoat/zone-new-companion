@@ -1,376 +1,189 @@
-"""Main UI shell."""
+"""Main window: navigation rail + pages."""
 
 from __future__ import annotations
 
-import sys
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from pathlib import Path
+
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMenu,
     QMainWindow,
-    QMessageBox,
-    QPushButton,
     QProgressBar,
-    QStatusBar,
-    QTableWidget,
-    QTableWidgetItem,
-    QTabWidget,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from zone_new_companion.models import Credentials
-from zone_new_companion.state import AppState
-from zone_new_companion.ui.widgets.login_panel import LoginPanel
-from zone_new_companion.ui.widgets.toast import ToastLabel
 from zone_new_companion import __version__
+from zone_new_companion.services.log_bus import LogBus, LogEntry
+from zone_new_companion.state import AppState
+from zone_new_companion.ui import theme
+from zone_new_companion.ui.media_view import LogoLoader
+from zone_new_companion.ui.pages.browser_page import BrowserPage
+from zone_new_companion.ui.pages.connection_page import ConnectionPage
+from zone_new_companion.ui.pages.journal_page import JournalPage
+from zone_new_companion.ui.widgets.common import Toast, button, label
+
+PAGE_CONNECTION, PAGE_LIVE, PAGE_MOVIES, PAGE_SERIES, PAGE_JOURNAL = range(5)
+_NAV = [
+    ("◉   Connexion", PAGE_CONNECTION),
+    ("▶   Chaînes", PAGE_LIVE),
+    ("◼   Films", PAGE_MOVIES),
+    ("❏   Séries", PAGE_SERIES),
+    ("≡   Journal", PAGE_JOURNAL),
+]
 
 
 class MainWindow(QMainWindow):
-    """Main application window."""
-
-    connect_requested = pyqtSignal(object)
-    category_selected = pyqtSignal(str, object)
-    item_activated = pyqtSignal(str, object)
-    verify_item_requested = pyqtSignal(str, object)
-    verify_all_channels_requested = pyqtSignal(str)
-    verify_tab_requested = pyqtSignal(str)
-    verify_cancel_requested = pyqtSignal()
-    # All logs signals removed for performance
-    now_playing_requested = pyqtSignal(str, object)
-    back_requested = pyqtSignal(str)
-    reset_requested = pyqtSignal()
-    history_selected = pyqtSignal(int)
-    history_clear_requested = pyqtSignal()
-    def __init__(self) -> None:
+    def __init__(self, bus: LogBus, app_data: Path, retries: int) -> None:
         super().__init__()
-        self.setWindowTitle(f"zone-new-companion v{__version__}")
-        self.setMinimumSize(1000, 650)
-        self._help_menu = QMenu("Help", self)
-        self._history_menu = QMenu("History", self)
-        self._verify_menu = QMenu("Verify", self)
-        self.menuBar().addMenu(self._help_menu)
-        self.menuBar().addMenu(self._verify_menu)
-        self.menuBar().addMenu(self._history_menu)
+        self.setWindowTitle("Zone Companion")
+        self.setMinimumSize(1100, 700)
+        self._unseen_problems = 0
 
-        self._help_info_action = self._help_menu.addAction("Info")
-        self._help_exit_action = self._help_menu.addAction("Exit")
-        self._help_exit_action.triggered.connect(self.close)
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        layout = QHBoxLayout(root)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Verify menu actions
-        self._verify_cancel_action = self._verify_menu.addAction("Cancel Verification")
-        self._verify_cancel_action.triggered.connect(self._emit_cancel_verification)
-        
-        self._verify_menu.addSeparator()
-        
-        self._verify_live_action = self._verify_menu.addAction("Verify Live")
-        self._verify_live_action.triggered.connect(lambda: self._emit_verify_tab("Live"))
-        
-        self._verify_movies_action = self._verify_menu.addAction("Verify Movies")
-        self._verify_movies_action.triggered.connect(lambda: self._emit_verify_tab("Movies"))
-        
-        self._verify_series_action = self._verify_menu.addAction("Verify Series")
-        self._verify_series_action.triggered.connect(lambda: self._emit_verify_tab("Series"))
+        # Navigation rail ------------------------------------------------------
+        rail = QWidget()
+        rail.setObjectName("NavRail")
+        rail.setFixedWidth(220)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(14, 22, 14, 18)
+        rail_layout.setSpacing(4)
+        brand = QHBoxLayout()
+        brand.setSpacing(0)
+        brand.setContentsMargins(10, 0, 0, 0)
+        brand.addWidget(label("ZONE", "Brand"))
+        brand.addWidget(label(".", "BrandAccent"))
+        brand.addStretch(1)
+        rail_layout.addLayout(brand)
+        sub = label("COMPANION", "BrandSub")
+        sub.setContentsMargins(11, 0, 0, 0)
+        rail_layout.addWidget(sub)
+        rail_layout.addSpacing(26)
 
-        # Logs functionality completely removed
+        self._nav_group = QButtonGroup(self)
+        self._nav_group.setExclusive(True)
+        self.nav_buttons: dict[int, object] = {}
+        for text, page in _NAV:
+            nav = button(text, "NavButton")
+            nav.setCheckable(True)
+            self._nav_group.addButton(nav, page)
+            self.nav_buttons[page] = nav
+            rail_layout.addWidget(nav)
+        self._nav_group.idClicked.connect(self.go_to)
+        rail_layout.addStretch(1)
 
-        self._toast = ToastLabel(self)
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        self.connection_status = label("", "Muted", wrap=True)
+        self.connection_status.setTextFormat(Qt.TextFormat.RichText)
+        self.connection_status.setContentsMargins(10, 0, 0, 0)
+        rail_layout.addWidget(self.connection_status)
+        rail_layout.addSpacing(6)
+        version = label(f"v{__version__}", "Faint")
+        version.setContentsMargins(10, 0, 0, 0)
+        rail_layout.addWidget(version)
+        layout.addWidget(rail)
 
-        self.login_panel = LoginPanel()
-        self.login_panel.connect_clicked.connect(self.connect_requested.emit)
-        self.login_panel.reset_clicked.connect(self._confirm_reset)
-        layout.addWidget(self.login_panel, 0)
-
+        # Pages ----------------------------------------------------------------
         right = QWidget()
+        right.setObjectName("Page")
         right_layout = QVBoxLayout(right)
-        
-        # Create tab widget (verify button moved to titlebar menu)
-        self.tab_widget = QTabWidget()
-        
-        self.category_lists: dict[str, QListWidget] = {}
-        self.item_tables: dict[str, QTableWidget] = {}
-        for tab_name in ("Live", "Movies", "Series"):
-            tab = QWidget()
-            tab_layout = QHBoxLayout(tab)
-            categories = QListWidget()
-            categories.setToolTip("Categories - Click to load channels/movies/series")
-            categories.setAlternatingRowColors(True)
-            table = QTableWidget()
-            table.setToolTip("Playlist items - Double-click to play, right-click for options")
-            table.setAlternatingRowColors(True)
-            table.setSortingEnabled(True)
-            table.setColumnCount(5)
-            table.setHorizontalHeaderLabels(["Name", "Now Playing", "Status", "Verify", "Play"])
-            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-            table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-            table.verticalHeader().setVisible(False)
-            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-            table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            table.setShowGrid(True)
-            table.setStyleSheet("""
-                QTableWidget {
-                    gridline-color: #444444;
-                    background-color: #2b2b2b;
-                    alternate-background-color: #323232;
-                }
-                QTableWidget::item {
-                    padding: 5px;
-                    border-bottom: 1px solid #444444;
-                }
-                QTableWidget::item:selected {
-                    background-color: #0078d4;
-                }
-            """)
-            table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-            table.cellClicked.connect(lambda row, _col, name=tab_name: self._emit_now_playing(name, row))
-            table.cellDoubleClicked.connect(lambda row, _col, name=tab_name: self._emit_play_from_row(name, row))
-            tab_layout.addWidget(categories, 1)
-            tab_layout.addWidget(table, 3)
-            self.tab_widget.addTab(tab, tab_name)
-            self.category_lists[tab_name] = categories
-            self.item_tables[tab_name] = table
-
-            categories.itemClicked.connect(
-                lambda item, name=tab_name: self.category_selected.emit(name, item.data(Qt.ItemDataRole.UserRole)),
-            )
-            table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            table.customContextMenuRequested.connect(lambda _pos, name=tab_name: self.back_requested.emit(name))
-        right_layout.addWidget(self.tab_widget)
-        layout.addWidget(right, 1)
-
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setMinimumHeight(25)  # Increase height for better visibility
-        self.progress.setMinimumWidth(300)  # Increase width for better visibility
-        self.progress.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #555;
-                border-radius: 3px;
-                text-align: center;
-                font-weight: bold;
-                background-color: #2a2a2a;
-                color: white;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-                border-radius: 2px;
-            }
-        """)
-        self.progress.hide()
-        self.status_label = QLabel("Ready")
-        status = QStatusBar()
-        status.addPermanentWidget(self.status_label, 1)
-        status.addPermanentWidget(self.progress)
-        self.setStatusBar(status)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
+        self.progress.setVisible(False)
+        right_layout.addWidget(self.progress)
+        self.progress_spacer = QWidget()
+        self.progress_spacer.setFixedHeight(3)
+        right_layout.addWidget(self.progress_spacer)
 
-    def _confirm_reset(self) -> None:
-        message = QMessageBox(self)
-        message.setIcon(QMessageBox.Icon.Warning)
-        message.setWindowTitle("Confirm reset")
-        message.setText("Reset all form fields?")
-        message.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if message.exec() == QMessageBox.StandardButton.Yes:
-            self.reset_requested.emit()
+        self.stack = QStackedWidget()
+        right_layout.addWidget(self.stack, 1)
+        layout.addWidget(right, 1)
 
+        self.logo_loader = LogoLoader(app_data / "logo-cache", self)
+        self.connection_page = ConnectionPage()
+        self.browser_pages = {
+            "Live": BrowserPage("Live", self.logo_loader),
+            "Movies": BrowserPage("Movies", self.logo_loader),
+            "Series": BrowserPage("Series", self.logo_loader),
+        }
+        self.journal_page = JournalPage(bus, app_data / "logs", retries)
+        for widget in (
+            self.connection_page,
+            self.browser_pages["Live"],
+            self.browser_pages["Movies"],
+            self.browser_pages["Series"],
+            self.journal_page,
+        ):
+            self.stack.addWidget(widget)
+        for page in self.browser_pages.values():
+            page.go_connect_requested.connect(lambda: self.go_to(PAGE_CONNECTION))
+
+        self.toast = Toast(self)
+        bus.entry_added.connect(self._on_log_entry)
+        self.go_to(PAGE_CONNECTION)
+        self._render_connection(None)
+
+    # ------------------------------------------------------------ navigation
+    def go_to(self, page: int) -> None:
+        self.stack.setCurrentIndex(page)
+        nav = self.nav_buttons[page]
+        nav.setChecked(True)
+        if page == PAGE_JOURNAL:
+            self._unseen_problems = 0
+            self._update_journal_badge()
+
+    def _on_log_entry(self, entry: LogEntry) -> None:
+        if entry.level in ("WARNING", "ERROR", "CRITICAL") and self.stack.currentIndex() != PAGE_JOURNAL:
+            self._unseen_problems += 1
+            self._update_journal_badge()
+
+    def _update_journal_badge(self) -> None:
+        text = "≡   Journal"
+        if self._unseen_problems:
+            text += f"   ({self._unseen_problems})"
+        self.nav_buttons[PAGE_JOURNAL].setText(text)
+
+    # ----------------------------------------------------------------- state
     def apply_state(self, state: AppState) -> None:
-        """Render state changes."""
-        self.status_label.setText(state.status_text)
-        
-        # Handle progress bar visibility and text
-        if state.busy:
-            self.progress.show()
-            # Show verification progress if available
-            if "Verifying" in state.status_text:
-                self.progress.setRange(0, 0)  # Indeterminate progress
-                self.progress.setFormat("Verifying...")
-            elif "Priority verifying" in state.status_text:
-                self.progress.setRange(0, 0)  # Indeterminate progress
-                self.progress.setFormat("Priority Verification...")
-            else:
-                self.progress.setRange(0, 0)  # Indeterminate progress
-                self.progress.setFormat("Loading...")
-        else:
-            self.progress.hide()
-            self.progress.setFormat("")
-        self.login_panel.set_connection_info(state.credential_info)
-        for tab_name, categories in state.categories.items():
-            list_widget = self.category_lists[tab_name]
-            list_widget.clear()
-            for category in categories:
-                item = QListWidgetItem(category.name)
-                item.setData(Qt.ItemDataRole.UserRole, category)
-                list_widget.addItem(item)
-        for tab_name, items in state.current_items.items():
-            table = self.item_tables[tab_name]
-            table.setRowCount(0)
-            for media in items:
-                row = table.rowCount()
-                table.insertRow(row)
-                name_item = QTableWidgetItem(media.name)
-                name_item.setData(Qt.ItemDataRole.UserRole, media)
-                now_text = state.now_playing.get(tab_name, {}).get(media.id, "")
-                now_item = QTableWidgetItem(now_text)
-                # Use persistent verification results first, fallback to current tab results
-                status = state.persistent_verification_results.get(media.id, "")
-                if not status:
-                    status = state.verification_results.get(tab_name, {}).get(media.id, "")
-                status_item = QTableWidgetItem(status)
-                
-                # Apply color highlighting based on verification status
-                if status.startswith("OK") or status.startswith("✓"):
-                    status_item.setBackground(QColor("#2d5a2d"))  # Green for good
-                    status_item.setForeground(QColor("#ffffff"))  # White text
-                elif status.startswith("OFF") or status.startswith("✗"):
-                    status_item.setBackground(QColor("#8b0000"))  # Dark red for unreachable
-                    status_item.setForeground(QColor("#ffffff"))  # White text
-                elif status.startswith("UNSTABLE") or status.startswith("⚠"):
-                    status_item.setBackground(QColor("#ff8c00"))  # Orange/yellow for unstable
-                    status_item.setForeground(QColor("#000000"))  # Black text
-                else:
-                    status_item.setBackground(QColor("#4a4a4a"))  # Gray for unknown
-                    status_item.setForeground(QColor("#ffffff"))  # White text
-                table.setItem(row, 0, name_item)
-                table.setItem(row, 1, now_item)
-                table.setItem(row, 2, status_item)
+        busy = state.busy
+        self.progress.setVisible(busy)
+        self.progress_spacer.setVisible(not busy)
+        self.connection_page.set_busy(busy)
+        connected = state.active_profile is not None and bool(state.credential_info)
+        self.connection_page.set_account(state.active_profile if connected else None, state.credential_info)
+        for tab_name, page in self.browser_pages.items():
+            page.set_connected(connected)
+            page.set_busy(busy)
+            page.set_categories(state.categories.get(tab_name, []))
+            status = dict(state.persistent_verification_results)
+            status.update(state.verification_results.get(tab_name, {}))
+            page.set_items(state.current_items.get(tab_name, []), status, state.now_playing.get(tab_name, {}))
+        self._render_connection(state if connected else None)
 
-                verify_button = QPushButton("🔍")
-                verify_button.setToolTip("Verify stream")
-                verify_button.clicked.connect(lambda checked=False, name=tab_name, m=media: self.verify_item_requested.emit(name, m))
-                verify_button.setStyleSheet("""
-                    QPushButton {
-                        font-size: 14px;
-                        padding: 4px;
-                        border-radius: 3px;
-                        background-color: #3a3a3a;
-                        color: white;
-                        min-width: 30px;
-                        max-width: 30px;
-                    }
-                    QPushButton:hover {
-                        background-color: #4a4a4a;
-                    }
-                    QPushButton:pressed {
-                        background-color: #2a2a2a;
-                    }
-                """)
-                
-                play_button = QPushButton("▶")
-                play_button.setToolTip("Play stream")
-                play_button.clicked.connect(lambda checked=False, name=tab_name, m=media: self.item_activated.emit(name, m))
-                play_button.setStyleSheet("""
-                    QPushButton {
-                        font-size: 14px;
-                        padding: 4px;
-                        border-radius: 3px;
-                        background-color: #3a3a3a;
-                        color: white;
-                        min-width: 30px;
-                        max-width: 30px;
-                    }
-                    QPushButton:hover {
-                        background-color: #4a4a4a;
-                    }
-                    QPushButton:pressed {
-                        background-color: #2a2a2a;
-                    }
-                """)
-                table.setCellWidget(row, 3, verify_button)
-                table.setCellWidget(row, 4, play_button)
-
-                self._apply_row_color(table, row, status)
-
-    def notify(self, text: str) -> None:
-        """Show toast notification."""
-        self._toast.show_message(text)
-
-    def populate_form(self, credentials: Credentials) -> None:
-        """Load credentials into form."""
-        self.login_panel.populate_form(credentials)
-
-    def set_history_actions(self, labels: list[str]) -> None:
-        """Populate top menu history actions."""
-        self._history_menu.clear()
-        if not labels:
-            action = self._history_menu.addAction("No successful connections yet")
-            action.setEnabled(False)
+    def _render_connection(self, state: AppState | None) -> None:
+        if state is None or state.active_profile is None:
+            self.connection_status.setText(f"<span style='color:{theme.TEXT_FAINT}'>●</span>&nbsp; Non connecté")
             return
-        for index, label in enumerate(labels):
-            action = self._history_menu.addAction(label)
-            action.triggered.connect(lambda checked=False, idx=index: self.history_selected.emit(idx))
+        host = state.active_profile.base_url.split("://", 1)[-1].split("/", 1)[0]
+        cons = state.credential_info.get("Active/Max Connections", "")
+        extra = f"<br><span style='color:{theme.TEXT_FAINT}'>Connexions {cons}</span>" if cons else ""
+        self.connection_status.setText(f"<span style='color:{theme.OK}'>●</span>&nbsp; {host}{extra}")
 
-    def set_history_grouped(self, groups: dict[str, list[tuple[int, str]]]) -> None:
-        """Populate history menu grouped by day."""
-        self._history_menu.clear()
-        clear_action = self._history_menu.addAction("Clear History")
-        clear_action.triggered.connect(self.history_clear_requested.emit)
-        saved_menu = self._history_menu.addMenu("Saved Credentials")
-        if not groups:
-            action = saved_menu.addAction("No successful connections yet")
-            action.setEnabled(False)
-            return
-        for day, entries in groups.items():
-            sub = saved_menu.addMenu(day)
-            for index, label in entries:
-                action = sub.addAction(label)
-                action.triggered.connect(lambda checked=False, idx=index: self.history_selected.emit(idx))
+    def notify(self, text: str, kind: str = "info") -> None:
+        self.toast.show_message(text, kind)
 
-    def set_help_info(self, callback) -> None:
-        self._help_info_action.triggered.connect(callback)
-
-    @staticmethod
-    def _apply_row_color(table: QTableWidget, row: int, status: str) -> None:
-        if status.startswith("OK"):
-            color = QColor(46, 125, 50, 80)
-        elif status.startswith("OFF"):
-            color = QColor(198, 40, 40, 80)
-        else:
-            return
-        for col in range(0, 3):
-            item = table.item(row, col)
-            if item is not None:
-                item.setBackground(color)
-
-    def _emit_play_from_row(self, tab_name: str, row: int) -> None:
-        table = self.item_tables[tab_name]
-        cell = table.item(row, 0)
-        if cell is None:
-            return
-        media = cell.data(Qt.ItemDataRole.UserRole)
-        self.item_activated.emit(tab_name, media)
-
-    def _emit_now_playing(self, tab_name: str, row: int) -> None:
-        table = self.item_tables[tab_name]
-        cell = table.item(row, 0)
-        if cell is None:
-            return
-        media = cell.data(Qt.ItemDataRole.UserRole)
-        self.now_playing_requested.emit(tab_name, media)
-
-    def _emit_verify_all_channels(self) -> None:
-        """Emit verify all channels for current tab."""
-        current_index = self.tab_widget.currentIndex()
-        current_tab = self.tab_widget.tabText(current_index)
-        if current_tab in ("Live", "Movies", "Series"):
-            self.verify_all_channels_requested.emit(current_tab)
-
-    def _emit_verify_tab(self, tab_name: str) -> None:
-        """Emit verify request for specific tab."""
-        if tab_name in ("Live", "Movies", "Series"):
-            self.verify_tab_requested.emit(tab_name)
-
-    def _emit_cancel_verification(self) -> None:
-        """Emit cancel verification request."""
-        self.verify_cancel_requested.emit()
-
-    # All logs emit methods removed for performance
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self.toast.isVisible():
+            self.toast.move((self.width() - self.toast.width()) // 2, self.height() - self.toast.height() - 28)
