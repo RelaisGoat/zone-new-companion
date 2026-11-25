@@ -126,5 +126,5 @@ def run() -> None:
         connection.populate(controller.config.last_input)
 
     qt_app.aboutToQuit.connect(lambda: controller.save_ui_state(window.width(), window.height()))
-    window.show()
+    window.showMaximized()
     sys.exit(qt_app.exec())

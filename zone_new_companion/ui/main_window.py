@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -130,6 +131,10 @@ class MainWindow(QMainWindow):
             page.go_connect_requested.connect(lambda: self.go_to(PAGE_CONNECTION))
 
         self.toast = Toast(self)
+        fullscreen = QShortcut(QKeySequence("F11"), self)
+        fullscreen.activated.connect(self.toggle_fullscreen)
+        leave = QShortcut(QKeySequence("Esc"), self)
+        leave.activated.connect(lambda: self.showMaximized() if self.isFullScreen() else None)
         bus.entry_added.connect(self._on_log_entry)
         self.go_to(PAGE_CONNECTION)
         self._render_connection(None)
@@ -179,6 +184,12 @@ class MainWindow(QMainWindow):
         cons = state.credential_info.get("Active/Max Connections", "")
         extra = f"<br><span style='color:{theme.TEXT_FAINT}'>Connexions {cons}</span>" if cons else ""
         self.connection_status.setText(f"<span style='color:{theme.OK}'>●</span>&nbsp; {host}{extra}")
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showMaximized()
+        else:
+            self.showFullScreen()
 
     def notify(self, text: str, kind: str = "info") -> None:
         self.toast.show_message(text, kind)

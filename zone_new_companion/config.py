@@ -17,7 +17,7 @@ class UiSettings:
     dark_theme: bool = True
     width: int = 1320
     height: int = 820
-    auto_retries: int = 2
+    auto_retries: int = 1
 
 
 @dataclass(slots=True)
@@ -76,7 +76,7 @@ class ConfigStore:
             dark_theme=bool(ui_payload.get("dark_theme", True)),
             width=int(ui_payload.get("width", 1200)),
             height=int(ui_payload.get("height", 760)),
-            auto_retries=int(ui_payload.get("auto_retries", 2)),
+            auto_retries=int(ui_payload.get("auto_retries", 1)),
         )
         return AppConfig(ui=ui, successful_history=history, last_input=last_input)
 

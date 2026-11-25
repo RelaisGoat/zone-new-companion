@@ -308,7 +308,13 @@ class AppController:
             )
             if self._on_playback_progress is not None:
                 session.progress.connect(self._on_playback_progress)
-            session.finished.connect(lambda ok, message: self._on_playback_finished(ok, message, on_success, on_error))
+            session.finished.connect(
+                lambda ok, message, current=session: (
+                    self._on_playback_finished(ok, message, on_success, on_error)
+                    if current is self._session
+                    else None
+                ),
+            )
             self._session = session
             session.start()
 

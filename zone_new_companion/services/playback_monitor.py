@@ -86,15 +86,15 @@ class PlaybackSession(QObject):
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    ATTEMPT_TIMEOUT_S = 20.0
+    ATTEMPT_TIMEOUT_S = 30.0
 
     def __init__(
         self,
         stream_url: str,
         title: str,
         log_dir: Path,
-        retries: int = 2,
-        retry_delay_s: float = 4.0,
+        retries: int = 1,
+        retry_delay_s: float = 6.0,
         line_was_free: bool | None = None,
     ) -> None:
         super().__init__()
@@ -148,13 +148,9 @@ class PlaybackSession(QObject):
                 self.finished.emit(True, f"{self._title} : lecture en cours")
                 return
             if last.idle:
-                # Do not kill a VLC that simply did not start: the user may be using it.
-                self._log(
-                    logging.WARNING,
-                    "VLC est ouvert mais n'a pas lancé la lecture tout seul (aucune requête en 20 s). "
-                    "Vérifie dans VLC : Outils › Préférences › Playlist › « Lancement automatique ».",
-                )
-                self.finished.emit(False, f"{self._title} : VLC n'a pas démarré la lecture")
+                # VLC closed by the user, or a new channel was requested: stop quietly.
+                self._log(logging.INFO, f"Suivi arrêté : {last.reason}")
+                self.finished.emit(False, f"{self._title} : {last.reason}")
                 return
             if last.codes and last.codes[-1] in (403, 404):
                 # Retrying will not change a missing channel or a banned account.
@@ -199,31 +195,60 @@ class PlaybackSession(QObject):
         return result
 
     def _watch(self, log_file: Path) -> AttemptResult:
+        """Tail VLC's log until we know for sure, or until the deadline.
+
+        Two Windows quirks shape this:
+        * VLC writes HTTP dumps over several lines ("incoming response:" then
+          "HTTP/1.1 302 Found" on the next line, then the headers);
+        * its log file is written in blocks, so lines can arrive seconds late.
+        So we only kill VLC on an *explicit* failure, never on silence.
+        """
         deadline = time.monotonic() + self.ATTEMPT_TIMEOUT_S
         position = 0
         buffer = ""
         codes: list[int] = []
-        saw_request = False
+        saw_activity = False
+        expect_status = False
         last_reported: tuple[str, int] | None = None
         current_host = _host(self._url)
 
-        def handle(line: str) -> AttemptResult | None:
-            nonlocal current_host, last_reported, saw_request
-            if "outgoing request" in line or "sending request" in line or "creating access" in line:
-                saw_request = True
+        def record(code: int) -> None:
+            nonlocal last_reported
+            key = (current_host, code)
+            if key == last_reported:  # VLC retries in HTTP/1.0 internally, skip duplicates
+                return
+            last_reported = key
+            codes.append(code)
+            level = logging.INFO if code < 400 else logging.WARNING
+            self._log(level, f"{current_host} → HTTP {code} : {self._explain(code)}")
+
+        def handle(raw: str) -> AttemptResult | None:
+            nonlocal current_host, saw_activity, expect_status
+            line = raw.strip()
+            if not line:
+                return None
+            if "creating access" in line or "outgoing request" in line or "sending request" in line:
+                saw_activity = True
+            if expect_status:
+                expect_status = False
+                status = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", line)
+                if status:
+                    record(int(status.group(1)))
+                    return None
+            if line.endswith("incoming response:"):
+                expect_status = True
+                return None
+            host_line = re.match(r"Host:\s*(\S+)", line)
+            if host_line:
+                current_host = host_line.group(1).split(":")[0]
+                return None
             host_match = _RE_REQUEST_HOST.search(line)
             if host_match:
                 current_host = host_match.group(1).split(":")[0]
                 return None
             response = _RE_RESPONSE.search(line)
             if response:
-                code = int(response.group(1))
-                key = (current_host, code)
-                if key != last_reported:  # VLC retries HTTP/1.0 internally, avoid duplicates
-                    last_reported = key
-                    codes.append(code)
-                    level = logging.INFO if code < 400 else logging.WARNING
-                    self._log(level, f"{current_host} → HTTP {code} : {self._explain(code)}")
+                record(int(response.group(1)))
                 return None
             redirect = _RE_REDIRECT.search(line)
             if redirect:
@@ -244,38 +269,57 @@ class PlaybackSession(QObject):
                 self._log(logging.WARNING, f"Erreur d'accès VLC : {access_error.group(1)}")
             return None
 
+        def drain() -> AttemptResult | None:
+            nonlocal position, buffer
+            if not log_file.exists():
+                return None
+            try:
+                with log_file.open("r", encoding="utf-8", errors="replace") as handle_file:
+                    handle_file.seek(position)
+                    chunk = handle_file.read()
+                    position = handle_file.tell()
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buffer += chunk.replace("\r", "")
+            *lines, buffer = buffer.split("\n")
+            for line in lines:
+                outcome = handle(line)
+                if outcome is not None:
+                    return outcome
+            return None
+
         while time.monotonic() < deadline and not self._cancelled.is_set():
-            if log_file.exists():
-                try:
-                    with log_file.open("r", encoding="utf-8", errors="replace") as handle_file:
-                        handle_file.seek(position)
-                        chunk = handle_file.read()
-                        position = handle_file.tell()
-                except OSError:
-                    chunk = ""
-                if chunk:
-                    buffer += chunk
-                    *lines, buffer = buffer.split("\n")
-                    for line in lines:
-                        outcome = handle(line)
-                        if outcome is not None:
-                            return outcome
+            outcome = drain()
+            if outcome is not None:
+                return outcome
             if self._process is not None and self._process.poll() is not None:
-                return AttemptResult(False, "VLC a été fermé", codes)
+                outcome = drain()  # VLC flushes its log when it exits
+                if outcome is not None and not outcome.ok:
+                    return outcome
+                return AttemptResult(False, "VLC a été fermé", codes, idle=True)
             time.sleep(0.25)
 
         if self._cancelled.is_set():
-            return AttemptResult(False, "annulé", codes)
-        if codes and codes[-1] < 400:
-            # Stream answered fine but no picture logged yet (radio, slow buffer…)
-            self._log(logging.INFO, "Le serveur répond, pas encore d'image après 20 s (flux lent ?)")
-            return AttemptResult(True, "lecture (lente)", codes)
-        if codes:
+            return AttemptResult(False, "annulé", codes, idle=True)
+        if codes and codes[-1] >= 400:
             code = codes[-1]
-            return AttemptResult(False, f"HTTP {code} — {explain_http(code)}", codes)
-        if not saw_request:
-            return AttemptResult(False, "VLC n'a rien demandé au serveur", codes, idle=True)
-        return AttemptResult(False, "aucune réponse du serveur en 20 s", codes)
+            return AttemptResult(False, f"HTTP {code} — {self._explain(code)}", codes)
+        # No explicit failure: VLC is most likely playing and its log is just late.
+        if codes or saw_activity:
+            self._log(
+                logging.INFO,
+                f"Pas de confirmation d'image après {self.ATTEMPT_TIMEOUT_S:.0f} s (VLC écrit son journal par paquets), "
+                "mais aucune erreur : VLC est laissé ouvert",
+            )
+        else:
+            self._log(
+                logging.INFO,
+                f"VLC n'a encore rien écrit après {self.ATTEMPT_TIMEOUT_S:.0f} s : laissé ouvert. "
+                "S'il attend un clic, vérifie Outils › Préférences › Playlist › « Lancement automatique »",
+            )
+        return AttemptResult(True, "lecture (non confirmée)", codes)
 
     def _explain(self, code: int) -> str:
         if code == 401 and self._line_was_free:
