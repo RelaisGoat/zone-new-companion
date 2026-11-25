@@ -279,10 +279,7 @@ class PlaybackSession(QObject):
 
     def _explain(self, code: int) -> str:
         if code == 401 and self._line_was_free:
-            return (
-                "refusé alors que la ligne était libre (0 connexion) : le serveur bloque la lecture "
-                "pour ce compte, cette IP ou ce lecteur (probablement pas une question de limite)"
-            )
+            return "IP probablement bloquée pour le moment (la ligne était libre, ce n'est pas la limite de connexions)"
         return explain_http(code)
 
     def _stop_process(self) -> None:
