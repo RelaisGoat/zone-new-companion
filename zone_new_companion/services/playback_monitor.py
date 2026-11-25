@@ -76,6 +76,7 @@ def _host(url: str) -> str:
 class AttemptResult:
     ok: bool
     reason: str
+    idle: bool = False  # VLC opened but never tried to read the stream
     codes: list[int] = field(default_factory=list)
 
 
@@ -94,6 +95,7 @@ class PlaybackSession(QObject):
         log_dir: Path,
         retries: int = 2,
         retry_delay_s: float = 4.0,
+        line_was_free: bool | None = None,
     ) -> None:
         super().__init__()
         self._url = stream_url
@@ -101,6 +103,7 @@ class PlaybackSession(QObject):
         self._log_dir = log_dir
         self._retries = max(0, retries)
         self._retry_delay = retry_delay_s
+        self._line_was_free = line_was_free
         self._cancelled = threading.Event()
         self._process: subprocess.Popen | None = None
 
@@ -144,6 +147,15 @@ class PlaybackSession(QObject):
             if last.ok:
                 self.finished.emit(True, f"{self._title} : lecture en cours")
                 return
+            if last.idle:
+                # Do not kill a VLC that simply did not start: the user may be using it.
+                self._log(
+                    logging.WARNING,
+                    "VLC est ouvert mais n'a pas lancé la lecture tout seul (aucune requête en 20 s). "
+                    "Vérifie dans VLC : Outils › Préférences › Playlist › « Lancement automatique ».",
+                )
+                self.finished.emit(False, f"{self._title} : VLC n'a pas démarré la lecture")
+                return
             if last.codes and last.codes[-1] in (403, 404):
                 # Retrying will not change a missing channel or a banned account.
                 break
@@ -161,6 +173,8 @@ class PlaybackSession(QObject):
             "--http-user-agent=Lavf/57.83.100",
             "--no-qt-error-dialogs",
             "--no-one-instance",
+            "--no-playlist-enqueue",
+            "--playlist-autostart",
             "--verbose=2",
             "--file-logging",
             f"--logfile={log_file}",
@@ -189,11 +203,14 @@ class PlaybackSession(QObject):
         position = 0
         buffer = ""
         codes: list[int] = []
+        saw_request = False
         last_reported: tuple[str, int] | None = None
         current_host = _host(self._url)
 
         def handle(line: str) -> AttemptResult | None:
-            nonlocal current_host, last_reported
+            nonlocal current_host, last_reported, saw_request
+            if "outgoing request" in line or "sending request" in line or "creating access" in line:
+                saw_request = True
             host_match = _RE_REQUEST_HOST.search(line)
             if host_match:
                 current_host = host_match.group(1).split(":")[0]
@@ -206,7 +223,7 @@ class PlaybackSession(QObject):
                     last_reported = key
                     codes.append(code)
                     level = logging.INFO if code < 400 else logging.WARNING
-                    self._log(level, f"{current_host} → HTTP {code} : {explain_http(code)}")
+                    self._log(level, f"{current_host} → HTTP {code} : {self._explain(code)}")
                 return None
             redirect = _RE_REDIRECT.search(line)
             if redirect:
@@ -220,7 +237,7 @@ class PlaybackSession(QObject):
             if any(marker in line for marker in _DEAD):
                 if codes and codes[-1] >= 400:
                     code = codes[-1]
-                    return AttemptResult(False, f"HTTP {code} — {explain_http(code)}", codes)
+                    return AttemptResult(False, f"HTTP {code} — {self._explain(code)}", codes)
                 return AttemptResult(False, "VLC n'a pas pu ouvrir le flux", codes)
             access_error = _RE_ACCESS_ERROR.search(line)
             if access_error and not codes:
@@ -256,7 +273,17 @@ class PlaybackSession(QObject):
         if codes:
             code = codes[-1]
             return AttemptResult(False, f"HTTP {code} — {explain_http(code)}", codes)
+        if not saw_request:
+            return AttemptResult(False, "VLC n'a rien demandé au serveur", codes, idle=True)
         return AttemptResult(False, "aucune réponse du serveur en 20 s", codes)
+
+    def _explain(self, code: int) -> str:
+        if code == 401 and self._line_was_free:
+            return (
+                "refusé alors que la ligne était libre (0 connexion) : le serveur bloque la lecture "
+                "pour ce compte, cette IP ou ce lecteur — pas un problème de limite"
+            )
+        return explain_http(code)
 
     def _stop_process(self) -> None:
         process = self._process

@@ -281,7 +281,11 @@ class AppController:
 
         def launch(payload: tuple[str, str]) -> None:
             stream_url, line_state = payload
+            line_was_free: bool | None = None
             if line_state:
+                _active, _, _maximum = line_state.partition("/")
+                if _active.isdigit() and _maximum.isdigit():
+                    line_was_free = int(_active) < int(_maximum)
                 active, _, maximum = line_state.partition("/")
                 if active.isdigit() and maximum.isdigit() and int(active) >= int(maximum):
                     LOGGER.warning(
@@ -300,6 +304,7 @@ class AppController:
                 item.name,
                 self._log_dir,
                 retries=self._config.ui.auto_retries,
+                line_was_free=line_was_free,
             )
             if self._on_playback_progress is not None:
                 session.progress.connect(self._on_playback_progress)
