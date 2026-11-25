@@ -184,7 +184,8 @@ class MediaDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self._loader = loader
         self.grid = False
-        self._hover_row = -1
+        self.mouse_pos: QPoint | None = None
+        self.pressed_row = -1
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         if self.grid:
@@ -246,11 +247,35 @@ class MediaDelegate(QStyledItemDelegate):
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
         return int(rect.left()) - 10
 
-    def _draw_play(self, painter: QPainter, rect: QRect, hovered: bool, expandable: bool) -> None:
-        if not hovered:
-            return
-        self._rounded(painter, QRectF(rect), rect.width() / 2, QColor(theme.ACCENT))
-        painter.setPen(QPen(QColor("white")))
+    def _draw_play(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        row_hovered: bool,
+        expandable: bool,
+        pressed: bool = False,
+    ) -> None:
+        over_button = self.mouse_pos is not None and rect.contains(self.mouse_pos)
+        if not row_hovered:
+            if self.grid:
+                return
+            # Always visible in list mode, discreet until the row is hovered.
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), rect.width() / 2, rect.width() / 2)
+            painter.setPen(QPen(QColor(theme.BORDER), 1.2))
+            painter.drawPath(path)
+            painter.setPen(QColor(theme.TEXT_FAINT))
+        else:
+            if pressed:
+                color = QColor(theme.ACCENT).darker(125)
+                rect = rect.adjusted(2, 2, -2, -2)
+            elif over_button:
+                color = QColor(theme.ACCENT_HOVER)
+                rect = rect.adjusted(-2, -2, 2, 2)
+            else:
+                color = QColor(theme.ACCENT)
+            self._rounded(painter, QRectF(rect), rect.width() / 2, color)
+            painter.setPen(QPen(QColor("white")))
         font = QFont(painter.font())
         font.setPointSizeF(11)
         font.setBold(True)
@@ -296,16 +321,14 @@ class MediaDelegate(QStyledItemDelegate):
             color_hex = theme.status_color(status)
             if color_hex:
                 self._rounded(painter, QRectF(rect.left() + 12, rect.top() + 12, 10, 10), 5, QColor(color_hex))
-            self._draw_play(painter, self._play_rect(rect), hovered, expandable)
+            self._draw_play(painter, self._play_rect(rect), hovered, expandable, index.row() == self.pressed_row)
             painter.restore()
             return
 
         logo_rect = QRect(rect.left() + 10, rect.top() + 7, 64, rect.height() - 14)
         self._draw_logo(painter, logo_rect, index, name)
-        right = rect.right() - 12
-        if hovered:
-            self._draw_play(painter, self._play_rect(rect), hovered, expandable)
-            right = self._play_rect(rect).left() - 12
+        self._draw_play(painter, self._play_rect(rect), hovered, expandable, index.row() == self.pressed_row)
+        right = self._play_rect(rect).left() - 12
         right = self._draw_pill(painter, right, rect.center().y(), status)
 
         text_left = logo_rect.right() + 14
@@ -339,10 +362,18 @@ class MediaDelegate(QStyledItemDelegate):
             )
         painter.restore()
 
+    def over_play(self, option_rect: QRect, pos: QPoint) -> bool:
+        return self._play_rect(option_rect.adjusted(4, 3, -4, -3)).contains(pos)
+
     def editorEvent(self, event, model, option, index) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            if self.over_play(option.rect, event.position().toPoint()):
+                self.pressed_row = index.row()
+                return True
         if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            rect = option.rect.adjusted(4, 3, -4, -3)
-            if self._play_rect(rect).contains(event.position().toPoint()):
+            was_pressed = self.pressed_row == index.row()
+            self.pressed_row = -1
+            if was_pressed and self.over_play(option.rect, event.position().toPoint()):
                 self.play_clicked.emit(index)
                 return True
         return super().editorEvent(event, model, option, index)
@@ -381,11 +412,26 @@ class MediaListView(QListView):
         self.viewport().update()
 
     def leaveEvent(self, event) -> None:  # noqa: N802
+        self._delegate.mouse_pos = None
+        self.viewport().unsetCursor()
         self.viewport().update()
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         super().mouseMoveEvent(event)
+        pos = event.position().toPoint()
+        self._delegate.mouse_pos = pos
+        index = self.indexAt(pos)
+        if index.isValid() and self._delegate.over_play(self.visualRect(index), pos):
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.viewport().unsetCursor()
+        self.viewport().update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        super().mouseReleaseEvent(event)
+        if self._delegate.pressed_row != -1:
+            self._delegate.pressed_row = -1
         self.viewport().update()
 
 

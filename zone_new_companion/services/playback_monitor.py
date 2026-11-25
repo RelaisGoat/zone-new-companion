@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import re
 import subprocess
 import threading
@@ -117,6 +116,13 @@ class PlaybackSession(QObject):
         LOGGER.log(level, message, extra={"source": "VLC"})
 
     def _run(self) -> None:
+        try:
+            self._run_inner()
+        except Exception as exc:  # noqa: BLE001 - never die silently in a thread
+            LOGGER.exception("Erreur interne pendant la lecture")
+            self.finished.emit(False, f"erreur interne : {exc}")
+
+    def _run_inner(self) -> None:
         vlc_path = resolve_vlc_path()
         if not vlc_path:
             self._log(logging.ERROR, "VLC introuvable. Installe-le depuis videolan.org.")
@@ -125,6 +131,7 @@ class PlaybackSession(QObject):
 
         attempts = self._retries + 1
         self._log(logging.INFO, f"▶ {self._title} — {self._url}")
+        self._log(logging.INFO, f"VLC : {vlc_path}")
         last: AttemptResult | None = None
         for attempt in range(1, attempts + 1):
             if self._cancelled.is_set():
@@ -160,17 +167,12 @@ class PlaybackSession(QObject):
             "--log-verbose=2",
             self._url,
         ]
-        startupinfo = None
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_SHOWNORMAL
+        # VLC is a normal windowed app: launch it as-is, no STARTUPINFO tweaks.
         try:
             self._process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                startupinfo=startupinfo,
             )
         except OSError as exc:
             self._log(logging.ERROR, f"Impossible de lancer VLC : {exc}")

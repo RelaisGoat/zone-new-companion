@@ -141,7 +141,6 @@ class BrowserPage(QWidget):
         self.view = MediaListView(self.delegate)
         self.view.setModel(self.proxy)
         self.view.doubleClicked.connect(self._activate_index)
-        self.view.activated.connect(self._activate_index)
         self.view.clicked.connect(self._on_item_clicked)
         self.delegate.play_clicked.connect(self._activate_index)
         self.view.customContextMenuRequested.connect(self._context_menu)

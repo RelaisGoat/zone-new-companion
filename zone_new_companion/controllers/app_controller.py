@@ -187,6 +187,12 @@ class AppController:
         )
         total = sum(len(rows) for rows in categories.values())
         LOGGER.info("Connecté à %s : %d catégories", credentials.base_url, total)
+        if total == 0:
+            LOGGER.warning(
+                "Le serveur a répondu mais ne donne aucune catégorie : identifiants refusés, "
+                "compte expiré ou serveur vide. Statut annoncé : %s",
+                connection_info.get("Status", "inconnu"),
+            )
         on_success(f"Connecté · {total} catégories")
 
     def load_items(
@@ -256,6 +262,8 @@ class AppController:
             self._session.cancel()  # stop watching the previous launch (VLC stays open)
 
         self._state_store.update(status_text=f"Préparation de {item.name}…")
+        if self._on_playback_progress is not None:
+            self._on_playback_progress(f"Lancement de {item.name}…")
         LOGGER.info("Lecture demandée : %s", item.name)
 
         def task() -> tuple[str, str]:

@@ -33,7 +33,7 @@ class OCRService:
             )
             return result.returncode == 0
         except (subprocess.TimeoutExpired, FileNotFoundError):
-            logger_service.warning("FFmpeg not found - OCR functionality will be limited")
+            logger_service.debug("FFmpeg not found - OCR functionality will be limited")
             return False
     
     def _check_tesseract(self) -> bool:
@@ -55,12 +55,12 @@ class OCRService:
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 continue
         
-        logger_service.error("Tesseract OCR not found - OCR functionality disabled")
-        logger_service.info("To enable OCR, install Tesseract:")
-        logger_service.info("  Ubuntu/Debian: sudo apt install tesseract-ocr")
-        logger_service.info("  Fedora/CentOS: sudo dnf install tesseract")
-        logger_service.info("  macOS: brew install tesseract")
-        logger_service.info("  Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki")
+        logger_service.debug("Tesseract OCR not found - OCR functionality disabled")
+        logger_service.debug("To enable OCR, install Tesseract:")
+        logger_service.debug("  Ubuntu/Debian: sudo apt install tesseract-ocr")
+        logger_service.debug("  Fedora/CentOS: sudo dnf install tesseract")
+        logger_service.debug("  macOS: brew install tesseract")
+        logger_service.debug("  Windows: Download from https://github.com/UB-Mannheim/tesseract/wiki")
         return False
     
     def analyze_stream_frame(self, stream_url: str, timeout: int = 10) -> Tuple[bool, str]:
