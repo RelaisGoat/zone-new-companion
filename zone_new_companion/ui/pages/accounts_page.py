@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QFrame,
@@ -22,6 +23,9 @@ from zone_new_companion.models import Credentials, PortalType
 from zone_new_companion.services.link_parser import parse_link
 from zone_new_companion.ui import theme
 from zone_new_companion.ui.widgets.common import button, card, label
+
+LOGGER = logging.getLogger("zone.secours")
+
 
 def account_key(account: Credentials) -> str:
     return f"{account.portal_type.value}|{account.base_url.lower()}|{account.username}"
@@ -59,6 +63,9 @@ class _Dot(QWidget):
         super().__init__()
         self.setFixedSize(12, 12)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.set_color(color)
+
+    def set_color(self, color: str) -> None:
         self.setStyleSheet(f"background: {color}; border-radius: 6px;")
 
 
@@ -156,6 +163,12 @@ class AccountsPage(QWidget):
         root.addStretch(1)
 
         self._checking = False
+        self._row_widgets: dict[str, AccountRow] = {}
+        self._checking_keys: set[str] = set()
+        self._removed_note = ""
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render)
         self._preview()
 
     # -------------------------------------------------------------- public
@@ -169,15 +182,15 @@ class AccountsPage(QWidget):
         self._checking = True
         self.refresh_button.setEnabled(False)
         self.refresh_button.setText("Vérification…")
-        for account in self._accounts:
-            key = account_key(account)
-            state, cons, detail, checked = self._status.get(key, ("", "", "", ""))
-            self._status[key] = ("checking", cons, detail, checked)
+        self._checking_keys = {account_key(account) for account in self._accounts}
         self._render()
         self.check_requested.emit(list(self._accounts))
 
     def set_status(self, account: Credentials, info: dict[str, str] | None, error: str = "") -> None:
         key = account_key(account)
+        self._checking_keys.discard(key)
+        if not any(account_key(a) == key for a in self._accounts):
+            return  # removed meanwhile
         now = datetime.now().strftime("%H:%M")
         if info is None:
             self._status[key] = ("bad", "", error or "injoignable", now)
@@ -185,6 +198,9 @@ class AccountsPage(QWidget):
             self._status[key] = ("unknown", "", "playlist M3U (vérifiée au moment de la bascule)", now)
         else:
             status = str(info.get("Status", "")).lower()
+            if status == "expired":
+                self._drop(key, "abonnement expiré")
+                return
             cons = str(info.get("Active/Max Connections", ""))
             expiry = str(info.get("Expiry", ""))
             try:
@@ -199,7 +215,6 @@ class AccountsPage(QWidget):
             else:
                 state = "bad"
                 detail = {
-                    "expired": "abonnement expiré",
                     "banned": "compte banni",
                     "disabled": "compte désactivé",
                     "unknown": "identifiants refusés",
@@ -207,12 +222,14 @@ class AccountsPage(QWidget):
                 }.get(status, status)
             self._status[key] = (state, cons, detail, now)
         self.last_check.setText(f"Vérifié à {now}")
-        self._render()
+        self._schedule_render()
 
     def checking_done(self) -> None:
         self._checking = False
+        self._checking_keys.clear()
         self.refresh_button.setEnabled(True)
         self.refresh_button.setText("↻  Tout vérifier")
+        self._render()
 
     # ------------------------------------------------------------- editing
     def _preview(self) -> None:
@@ -239,29 +256,43 @@ class AccountsPage(QWidget):
                 continue
             known.add(key)
             self._accounts.append(account)
+            self._checking_keys.add(key)
             added.append(account)
         self.bulk.clear()
         self._render()
         self.accounts_changed.emit(list(self._accounts))
         if added:
-            for account in added:
-                self._status[account_key(account)] = ("checking", "", "", "")
-            self._render()
             self.check_requested.emit(added)
 
-    def _move(self, index: int, delta: int) -> None:
-        target = index + delta
-        if 0 <= target < len(self._accounts):
-            self._accounts[index], self._accounts[target] = self._accounts[target], self._accounts[index]
-            self._render()
-            self.accounts_changed.emit(list(self._accounts))
+    def _drop(self, key: str, reason: str) -> None:
+        for index, account in enumerate(self._accounts):
+            if account_key(account) == key:
+                LOGGER.warning("Compte de secours « %s » retiré automatiquement : %s", _title(account), reason)
+                del self._accounts[index]
+                self._status.pop(key, None)
+                self._removed_note = f"« {_title(account)} » retiré : {reason}"
+                self.accounts_changed.emit(list(self._accounts))
+                self._schedule_render()
+                return
 
-    def _remove(self, index: int) -> None:
-        if 0 <= index < len(self._accounts):
-            self._status.pop(account_key(self._accounts[index]), None)
-            del self._accounts[index]
-            self._render()
-            self.accounts_changed.emit(list(self._accounts))
+    def _move(self, key: str, delta: int) -> None:
+        """Swap with the neighbour shown above/below (same priority group only)."""
+        order = self._display_order()
+        position = next((i for i, a in enumerate(order) if account_key(a) == key), -1)
+        target = position + delta
+        if position < 0 or not 0 <= target < len(order):
+            return
+        first, second = order[position], order[target]
+        i, j = self._accounts.index(first), self._accounts.index(second)
+        self._accounts[i], self._accounts[j] = self._accounts[j], self._accounts[i]
+        self._render()
+        self.accounts_changed.emit(list(self._accounts))
+
+    def _remove(self, key: str) -> None:
+        self._accounts = [a for a in self._accounts if account_key(a) != key]
+        self._status.pop(key, None)
+        self._render()
+        self.accounts_changed.emit(list(self._accounts))
 
     def _remove_all(self) -> None:
         if not self._accounts:
@@ -280,10 +311,10 @@ class AccountsPage(QWidget):
         self._render()
         self.accounts_changed.emit([])
 
-    def _rename(self, index: int) -> None:
-        if not 0 <= index < len(self._accounts):
+    def _rename(self, key: str) -> None:
+        account = next((a for a in self._accounts if account_key(a) == key), None)
+        if account is None:
             return
-        account = self._accounts[index]
         name, ok = QInputDialog.getText(self, "Renommer", "Nom du compte :", text=account.name)
         if ok:
             account.name = name.strip()
@@ -291,75 +322,156 @@ class AccountsPage(QWidget):
             self.accounts_changed.emit(list(self._accounts))
 
     # ------------------------------------------------------------ rendering
-    def _render(self) -> None:
-        while self.rows.count():
-            child = self.rows.takeAt(0).widget()
-            if child is not None:
-                child.deleteLater()
-        counts = {"ok": 0, "full": 0, "bad": 0}
-        for index, account in enumerate(self._accounts):
-            state, cons, detail, checked = self._status.get(account_key(account), ("", "", "", ""))
-            if state in counts:
-                counts[state] += 1
-            self.rows.addWidget(self._row(index, account, state, cons, detail))
-        self.empty.setVisible(not self._accounts)
-        self.clear_button.setEnabled(bool(self._accounts))
-        parts = []
-        if counts["ok"]:
-            parts.append(f"{counts['ok']} libre(s)")
-        if counts["full"]:
-            parts.append(f"{counts['full']} occupé(s)")
-        if counts["bad"]:
-            parts.append(f"{counts['bad']} invalide(s)")
-        self.summary.setText(("  ·  " + " · ".join(parts)) if parts else "")
+    def _state(self, account: Credentials) -> str:
+        return self._status.get(account_key(account), ("", "", "", ""))[0]
 
-    def _row(self, index: int, account: Credentials, state: str, cons: str, detail: str) -> QFrame:
-        row = QFrame()
-        row.setObjectName("Tile")
-        line = QHBoxLayout(row)
+    def _display_order(self) -> list[Credentials]:
+        """Exactly the order a fallback would use: free, unknown, full, then invalid."""
+        indexed = list(enumerate(self._accounts))
+        indexed.sort(key=lambda pair: (_RANK.get(self._state(pair[1]), 1), pair[0]))
+        return [account for _index, account in indexed]
+
+    def _schedule_render(self) -> None:
+        # Many results arrive within milliseconds: repaint once per burst.
+        if not self._render_timer.isActive():
+            self._render_timer.start(120)
+
+    def _render(self) -> None:
+        self._render_timer.stop()
+        self.setUpdatesEnabled(False)
+        try:
+            order = self._display_order()
+            wanted = [account_key(a) for a in order]
+            # Drop widgets of removed accounts.
+            for key in list(self._row_widgets):
+                if key not in wanted:
+                    widget = self._row_widgets.pop(key)
+                    self.rows.removeWidget(widget)
+                    widget.deleteLater()
+            counts = {"ok": 0, "full": 0, "bad": 0}
+            for position, account in enumerate(order):
+                key = account_key(account)
+                state, cons, detail, _checked = self._status.get(key, ("", "", "", ""))
+                if state in counts:
+                    counts[state] += 1
+                row = self._row_widgets.get(key)
+                if row is None:
+                    row = AccountRow(key)
+                    row.rename_clicked.connect(self._rename)
+                    row.move_clicked.connect(self._move)
+                    row.remove_clicked.connect(self._remove)
+                    self._row_widgets[key] = row
+                previous_rank = _RANK.get(self._state(order[position - 1]), 1) if position > 0 else None
+                next_rank = _RANK.get(self._state(order[position + 1]), 1) if position + 1 < len(order) else None
+                rank = _RANK.get(state, 1)
+                row.update_view(
+                    position + 1,
+                    account,
+                    "checking" if key in self._checking_keys else state,
+                    cons,
+                    detail,
+                    can_up=previous_rank == rank,
+                    can_down=next_rank == rank,
+                )
+                if self.rows.indexOf(row) != position:
+                    self.rows.removeWidget(row)
+                    self.rows.insertWidget(position, row)
+            self.empty.setVisible(not self._accounts)
+            self.clear_button.setEnabled(bool(self._accounts))
+            parts = []
+            if counts["ok"]:
+                parts.append(f"{counts['ok']} libre(s)")
+            if counts["full"]:
+                parts.append(f"{counts['full']} occupé(s)")
+            if counts["bad"]:
+                parts.append(f"{counts['bad']} invalide(s)")
+            if self._removed_note:
+                parts.append(self._removed_note)
+            self.summary.setText(("  ·  " + " · ".join(parts)) if parts else "")
+        finally:
+            self.setUpdatesEnabled(True)
+
+
+_RANK = {"ok": 0, "unknown": 1, "checking": 1, "": 1, "full": 2, "bad": 3}
+
+
+def _title(account: Credentials) -> str:
+    host = account.base_url.split("://", 1)[-1].split("/", 1)[0]
+    return account.name or account.username or host
+
+
+class AccountRow(QFrame):
+    """One account line, updated in place (no rebuild, no flicker)."""
+
+    rename_clicked = pyqtSignal(str)
+    move_clicked = pyqtSignal(str, int)
+    remove_clicked = pyqtSignal(str)
+
+    def __init__(self, key: str) -> None:
+        super().__init__()
+        self.key = key
+        self.setObjectName("Tile")
+        line = QHBoxLayout(self)
         line.setContentsMargins(14, 10, 10, 10)
         line.setSpacing(10)
-        color = {
-            "ok": theme.OK,
-            "full": theme.WARN,
-            "bad": theme.ERROR,
-            "checking": theme.TEXT_FAINT,
-        }.get(state, theme.SURFACE_3)
-        line.addWidget(_Dot(color))
+        self.dot = _Dot(theme.SURFACE_3)
+        line.addWidget(self.dot)
         texts = QVBoxLayout()
         texts.setSpacing(2)
+        self.title = label("", "SectionTitle")
+        self.sub = label("", "Faint")
+        texts.addWidget(self.title)
+        texts.addWidget(self.sub)
+        line.addLayout(texts, 1)
+        self.cons = label("—", "TileValue")
+        self.cons.setToolTip("Connexions actives / maximum")
+        self.cons.setMinimumWidth(60)
+        self.cons.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        line.addWidget(self.cons)
+        line.addSpacing(8)
+        self.rename_button = button("✎", "Ghost", "Renommer")
+        self.up_button = button("↑", "Ghost", "Monter (parmi les comptes du même état)")
+        self.down_button = button("↓", "Ghost", "Descendre")
+        self.remove_button = button("✕", "Ghost", "Retirer")
+        self.rename_button.clicked.connect(lambda: self.rename_clicked.emit(self.key))
+        self.up_button.clicked.connect(lambda: self.move_clicked.emit(self.key, -1))
+        self.down_button.clicked.connect(lambda: self.move_clicked.emit(self.key, 1))
+        self.remove_button.clicked.connect(lambda: self.remove_clicked.emit(self.key))
+        for btn in (self.rename_button, self.up_button, self.down_button, self.remove_button):
+            line.addWidget(btn)
+        self._last: tuple | None = None
+
+    def update_view(
+        self,
+        rank: int,
+        account: Credentials,
+        state: str,
+        cons: str,
+        detail: str,
+        can_up: bool,
+        can_down: bool,
+    ) -> None:
+        snapshot = (rank, account.name, account.username, state, cons, detail, can_up, can_down)
+        if snapshot == self._last:
+            return
+        self._last = snapshot
+        color = {"ok": theme.OK, "full": theme.WARN, "bad": theme.ERROR, "checking": theme.TEXT_FAINT}.get(
+            state, theme.SURFACE_3,
+        )
+        self.dot.set_color(color)
+        self.title.setText(f"{rank}. {_title(account)}")
         host = account.base_url.split("://", 1)[-1].split("/", 1)[0]
-        title = account.name or account.username or host
-        texts.addWidget(label(f"{index + 1}. {title}", "SectionTitle"))
         sub = f"{account.portal_type.value.upper()} · {account.username or 'playlist'} · {host}"
         if state == "checking":
             sub += " · vérification…"
         elif detail:
             sub += f" · {detail}"
-        sub_label = label(sub, "Faint")
-        if state == "bad":
-            sub_label.setStyleSheet(f"color: {theme.ERROR};")
-        texts.addWidget(sub_label)
-        line.addLayout(texts, 1)
-
-        show_cons = cons and state in ("ok", "full", "checking") and "unknown" not in cons.lower()
-        cons_label = label(cons.replace("/", " / ") if show_cons else "—", "TileValue")
-        cons_label.setToolTip("Connexions actives / maximum en ce moment")
-        if state == "full":
-            cons_label.setStyleSheet(f"color: {theme.WARN};")
-        elif state == "ok":
-            cons_label.setStyleSheet(f"color: {theme.OK};")
-        cons_label.setMinimumWidth(60)
-        cons_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        line.addWidget(cons_label)
-        line.addSpacing(8)
-        for text, tip, handler in (
-            ("✎", "Renommer", lambda _=False, i=index: self._rename(i)),
-            ("↑", "Monter (priorité)", lambda _=False, i=index: self._move(i, -1)),
-            ("↓", "Descendre", lambda _=False, i=index: self._move(i, 1)),
-            ("✕", "Retirer", lambda _=False, i=index: self._remove(i)),
-        ):
-            btn = button(text, "Ghost", tip)
-            btn.clicked.connect(handler)
-            line.addWidget(btn)
-        return row
+        self.sub.setText(sub)
+        self.sub.setStyleSheet(f"color: {theme.ERROR};" if state == "bad" else "")
+        show_cons = bool(cons) and state in ("ok", "full", "checking") and "unknown" not in cons.lower()
+        self.cons.setText(cons.replace("/", " / ") if show_cons else "—")
+        self.cons.setStyleSheet(
+            f"color: {theme.WARN};" if state == "full" else (f"color: {theme.OK};" if state == "ok" else ""),
+        )
+        self.up_button.setEnabled(can_up)
+        self.down_button.setEnabled(can_down)

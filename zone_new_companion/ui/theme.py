@@ -95,6 +95,7 @@ QPushButton#Primary:hover {{ background: {ACCENT_HOVER}; border-color: {ACCENT_H
 QPushButton#Primary:disabled {{ background: {SURFACE_3}; border-color: {SURFACE_3}; color: {TEXT_FAINT}; }}
 QPushButton#Ghost {{ background: transparent; border: none; color: {TEXT_MUTED}; padding: 6px 10px; }}
 QPushButton#Ghost:hover {{ color: {TEXT}; background: {SURFACE_2}; }}
+QPushButton#Ghost:disabled {{ color: {SURFACE_3}; background: transparent; }}
 QPushButton#Segment {{
     background: transparent; border: none; border-radius: 8px; padding: 7px 14px; color: {TEXT_MUTED};
 }}

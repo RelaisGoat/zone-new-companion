@@ -48,6 +48,8 @@ _SOURCES = {
     "stream_verifier": "Vérif",
     "ocr_service": "OCR",
     "player_launcher": "VLC",
+    "secours": "Secours",
+    "fallback": "Secours",
 }
 
 

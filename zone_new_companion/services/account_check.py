@@ -47,7 +47,9 @@ def check_account(account: Credentials) -> dict[str, str]:
     except requests.RequestException as exc:
         raise CheckError(str(exc)) from exc
     if response.status_code >= 400:
-        raise CheckError(f"le serveur répond HTTP {response.status_code}")
+        from zone_new_companion.services.playback_monitor import explain_http
+
+        raise CheckError(f"HTTP {response.status_code} : {explain_http(response.status_code)}")
     try:
         payload = response.json()
     except ValueError as exc:

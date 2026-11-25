@@ -72,8 +72,8 @@ def explain_http(code: int) -> str:
     if 300 <= code < 400:
         return "redirection"
     if 400 <= code < 500:
-        return "refusé par le serveur"
-    return "erreur serveur"
+        return "code maison du fournisseur (refus, pas forcément définitif)"
+    return "code maison du fournisseur (problème côté serveur, souvent temporaire)"
 
 
 def _host(url: str) -> str:
