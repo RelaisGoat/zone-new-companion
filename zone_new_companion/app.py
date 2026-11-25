@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Set Windows AppUserModelID BEFORE any UI initialization (must be before QApplication)
@@ -101,6 +102,41 @@ def run() -> None:
     connection.refresh_requested.connect(lambda: controller.refresh_connection_info(notify_ok, notify_error))
     connection.disconnect_requested.connect(do_disconnect)
     connection.history_clear_requested.connect(do_clear_history)
+
+    def test_backup(index: int) -> None:
+        accounts = controller.backup_accounts()
+        if not 0 <= index < len(accounts):
+            return
+        connection.set_backup_status(index, "Test en cours…")
+
+        def done(info: dict[str, str]) -> None:
+            status = info.get("Status", "?")
+            cons = info.get("Active/Max Connections", "")
+            expiry = info.get("Expiry", "")
+            ok = str(status).lower() in ("active", "m3u playlist") or info.get("Type") == "M3U Playlist"
+            if info.get("Type") == "M3U Playlist":
+                connection.set_backup_status(index, "Playlist M3U (vérifiée au moment de la bascule)", theme.TEXT_MUTED)
+                return
+            parts = [("Actif" if str(status).lower() == "active" else str(status))]
+            if cons:
+                parts.append(f"connexions {cons}")
+            if expiry:
+                try:
+                    expiry = datetime.strptime(expiry, "%Y-%m-%d %H:%M").strftime("%d/%m/%Y")
+                except ValueError:
+                    pass
+                parts.append(f"expire le {expiry}")
+            connection.set_backup_status(index, " · ".join(parts), theme.OK if ok else theme.WARN)
+
+        controller.test_backup(
+            accounts[index],
+            on_done=done,
+            on_error=lambda message: connection.set_backup_status(index, f"✖ {message}", theme.ERROR),
+        )
+
+    connection.backups_changed.connect(controller.set_backup_accounts)
+    connection.backup_test_requested.connect(test_backup)
+    connection.set_backups(controller.backup_accounts())
 
     for page in window.browser_pages.values():
         page.category_selected.connect(

@@ -27,6 +27,19 @@ class AppConfig:
     ui: UiSettings = field(default_factory=UiSettings)
     successful_history: list[Credentials] = field(default_factory=list)
     last_input: Credentials | None = None
+    backup_accounts: list[Credentials] = field(default_factory=list)
+
+
+def _credentials_from(row: dict[str, Any]) -> Credentials:
+    return Credentials(
+        name=str(row.get("name", "")),
+        base_url=str(row.get("base_url", "")),
+        portal_type=PortalType(str(row.get("portal_type", PortalType.XTREAM.value))),
+        username=str(row.get("username", "")),
+        password=str(row.get("password", "")),
+        mac_address=str(row.get("mac_address", "")),
+        saved_at=str(row.get("saved_at", "")),
+    )
 
 
 class ConfigStore:
@@ -78,7 +91,8 @@ class ConfigStore:
             height=int(ui_payload.get("height", 760)),
             auto_retries=int(ui_payload.get("auto_retries", 1)),
         )
-        return AppConfig(ui=ui, successful_history=history, last_input=last_input)
+        backups = [_credentials_from(row) for row in payload.get("backup_accounts", []) if isinstance(row, dict)]
+        return AppConfig(ui=ui, successful_history=history, last_input=last_input, backup_accounts=backups)
 
     def save(self, config: AppConfig) -> None:
         """Safely write config to disk."""

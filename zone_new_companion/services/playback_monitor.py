@@ -91,8 +91,19 @@ class AttemptResult:
     idle: bool = False  # VLC opened but never tried to read the stream
 
 
+@dataclass
+class Source:
+    """One way to play the channel: the main account or a backup one."""
+
+    label: str
+    url: str
+    line_was_free: bool | None = None
+    before_retry: Callable[[], None] | None = None
+    note: str = ""
+
+
 class PlaybackSession(QObject):
-    """One "play" click: launch, watch, retry if the server refuses."""
+    """One "play" click: launch, watch, retry, then fall back to backup accounts."""
 
     progress = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
@@ -101,22 +112,22 @@ class PlaybackSession(QObject):
 
     def __init__(
         self,
-        stream_url: str,
+        primary: Source,
         title: str,
         log_dir: Path,
         retries: int = 1,
         retry_delay_s: float = 6.0,
-        line_was_free: bool | None = None,
-        before_retry: Callable[[], None] | None = None,
+        next_source: Callable[[], Source | None] | None = None,
     ) -> None:
         super().__init__()
-        self._url = stream_url
+        self._source = primary
+        self._url = primary.url
         self._title = title
         self._log_dir = log_dir
         self._retries = max(0, retries)
         self._retry_delay = retry_delay_s
-        self._line_was_free = line_was_free
-        self._before_retry = before_retry
+        self._line_was_free = primary.line_was_free
+        self._next_source = next_source
         self._status = requests.Session()
         self._status.trust_env = False  # never send localhost polling through a proxy
         self._cancelled = threading.Event()
@@ -146,11 +157,45 @@ class PlaybackSession(QObject):
             self._log(logging.ERROR, "VLC introuvable. Installe-le depuis videolan.org.")
             self.finished.emit(False, "VLC introuvable")
             return
-
-        attempts = self._retries + 1
-        self._log(logging.INFO, f"▶ {self._title} — {self._url}")
         self._log(logging.INFO, f"VLC : {vlc_path}")
+
+        source: Source | None = self._source
+        first = True
         last: AttemptResult | None = None
+        while source is not None and not self._cancelled.is_set():
+            if not first:
+                self._log(logging.INFO, f"⇄ Bascule sur le compte « {source.label} » ({source.note})")
+                self.progress.emit(f"Bascule sur « {source.label} »…")
+            self._source = source
+            self._url = source.url
+            self._line_was_free = source.line_was_free
+            last = self._run_source(vlc_path, source)
+            if last.ok:
+                where = "" if first else f" (via « {source.label} »)"
+                self.finished.emit(True, f"{self._title} : lecture en cours{where}")
+                return
+            if last.idle:
+                # VLC closed by the user, or a new channel was requested: stop quietly.
+                self._log(logging.INFO, f"Suivi arrêté : {last.reason}")
+                self.finished.emit(False, f"{self._title} : {last.reason}")
+                return
+            self._log(logging.WARNING, f"Échec sur « {source.label} » : {last.reason}")
+            first = False
+            source = None
+            if self._next_source is not None and not self._cancelled.is_set():
+                try:
+                    source = self._next_source()
+                except Exception as exc:  # noqa: BLE001
+                    self._log(logging.WARNING, f"Compte de secours inutilisable : {exc}")
+                    source = None
+        reason = last.reason if last else "annulé"
+        self._log(logging.ERROR, f"✖ {self._title} : échec — {reason}")
+        self.finished.emit(False, f"{self._title} : {reason}")
+
+    def _run_source(self, vlc_path: str, source: Source) -> AttemptResult:
+        attempts = self._retries + 1
+        self._log(logging.INFO, f"▶ {self._title} — {source.url}")
+        last = AttemptResult(False, "annulé", idle=True)
         for attempt in range(1, attempts + 1):
             if self._cancelled.is_set():
                 break
@@ -158,28 +203,20 @@ class PlaybackSession(QObject):
                 self.progress.emit(f"Nouvel essai {attempt}/{attempts} dans {self._retry_delay:.0f} s…")
                 self._log(logging.INFO, f"Nouvel essai {attempt}/{attempts} dans {self._retry_delay:.0f} s")
                 time.sleep(self._retry_delay)
-                if self._before_retry is not None:
+                if source.before_retry is not None:
                     try:
                         self._log(logging.INFO, "Reconnexion à l'API du serveur avant le nouvel essai")
-                        self._before_retry()
+                        source.before_retry()
                     except Exception as exc:  # noqa: BLE001
                         self._log(logging.WARNING, f"Reconnexion à l'API impossible : {exc}")
             last = self._attempt(vlc_path, attempt, attempts)
-            if last.ok:
-                self.finished.emit(True, f"{self._title} : lecture en cours")
-                return
-            if last.idle:
-                # VLC closed by the user, or a new channel was requested: stop quietly.
-                self._log(logging.INFO, f"Suivi arrêté : {last.reason}")
-                self.finished.emit(False, f"{self._title} : {last.reason}")
-                return
+            if last.ok or last.idle:
+                return last
+            self._stop_process()
             if last.codes and last.codes[-1] in (403, 404):
                 # Retrying will not change a missing channel or a banned account.
                 break
-            self._stop_process()
-        reason = last.reason if last else "annulé"
-        self._log(logging.ERROR, f"✖ {self._title} : échec — {reason}")
-        self.finished.emit(False, f"{self._title} : {reason}")
+        return last
 
     def _attempt(self, vlc_path: str, attempt: int, attempts: int) -> AttemptResult:
         self._log_dir.mkdir(parents=True, exist_ok=True)

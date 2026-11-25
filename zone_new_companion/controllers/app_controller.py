@@ -18,7 +18,8 @@ from zone_new_companion.models import Credentials, MediaItem, PlaylistCategory, 
 from zone_new_companion.services.base import PortalService
 from zone_new_companion.services.m3u_service import M3UService
 from zone_new_companion.services.ocr_service import OCRService
-from zone_new_companion.services.playback_monitor import PlaybackSession
+from zone_new_companion.services.fallback import account_label, channel_matcher
+from zone_new_companion.services.playback_monitor import PlaybackSession, Source
 from zone_new_companion.services.stalker_service import StalkerService
 from zone_new_companion.services.stream_verifier import StreamVerifier
 from zone_new_companion.services.xtream_service import XtreamService
@@ -301,13 +302,19 @@ class AppController:
                 if info:
                     info["Active/Max Connections"] = line_state
                     self._state_store.update(credential_info=info)
+            primary = Source(
+                label=account_label(profile),
+                url=stream_url,
+                line_was_free=line_was_free,
+                before_retry=lambda: service.fetch_connection_info(profile),
+                note="compte principal",
+            )
             session = PlaybackSession(
-                stream_url,
+                primary,
                 item.name,
                 self._log_dir,
                 retries=self._config.ui.auto_retries,
-                line_was_free=line_was_free,
-                before_retry=lambda: service.fetch_connection_info(profile),
+                next_source=self._fallback_iterator(profile, item),
             )
             if self._on_playback_progress is not None:
                 session.progress.connect(self._on_playback_progress)
@@ -324,6 +331,85 @@ class AppController:
         worker = TaskWorker(task)
         worker.signals.succeeded.connect(launch)
         worker.signals.failed.connect(lambda message: self._on_error(message, on_error))
+        self._thread_pool.start(worker)
+
+    def _fallback_iterator(self, profile: Credentials, item: MediaItem) -> Callable[[], Source | None] | None:
+        """Yield backup accounts one by one, each with the matching channel link."""
+        if item.item_type != "channel":
+            return None
+        backups = [
+            backup
+            for backup in self._config.backup_accounts
+            if (backup.base_url, backup.username, backup.mac_address)
+            != (profile.base_url, profile.username, profile.mac_address)
+        ]
+        if not backups:
+            return None
+        remaining = list(backups)
+
+        def next_source() -> Source | None:
+            while remaining:
+                backup = remaining.pop(0)
+                label = account_label(backup)
+                try:
+                    resolution = channel_matcher.resolve(profile, item, backup)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Compte de secours « %s » injoignable : %s", label, self._humanize(str(exc)))
+                    continue
+                if resolution is None:
+                    LOGGER.warning("« %s » introuvable sur le compte de secours « %s »", item.name, label)
+                    continue
+                line_was_free: bool | None = None
+                backup_service = self._fresh_service(backup)
+                if backup.portal_type == PortalType.XTREAM and backup_service is not None:
+                    try:
+                        cons = backup_service.fetch_connection_info(backup).get("Active/Max Connections", "")
+                        active, _, maximum = cons.partition("/")
+                        if active.isdigit() and maximum.isdigit():
+                            line_was_free = int(active) < int(maximum)
+                            LOGGER.info("Ligne de secours « %s » : %s connexions", label, cons)
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("État de la ligne « %s » illisible : %s", label, self._humanize(str(exc)))
+                return Source(
+                    label=label,
+                    url=resolution.url,
+                    line_was_free=line_was_free,
+                    before_retry=(
+                        (lambda b=backup, svc=backup_service: svc.fetch_connection_info(b))
+                        if backup_service is not None and backup.portal_type == PortalType.XTREAM
+                        else None
+                    ),
+                    note=resolution.method,
+                )
+            return None
+
+        return next_source
+
+    def _fresh_service(self, account: Credentials) -> PortalService:
+        """A separate service instance: they cache server endpoints, so never share one across servers."""
+        return type(self._service_for(account))()
+
+    # ------------------------------------------------------------ backups
+    def backup_accounts(self) -> list[Credentials]:
+        return list(self._config.backup_accounts)
+
+    def set_backup_accounts(self, accounts: list[Credentials]) -> None:
+        self._config.backup_accounts = list(accounts)
+        self._config_store.save(self._config)
+        LOGGER.info("Comptes de secours : %d enregistré(s)", len(accounts))
+
+    def test_backup(
+        self,
+        account: Credentials,
+        on_done: Callable[[dict[str, str]], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        def task() -> dict[str, str]:
+            return self._fresh_service(account).fetch_connection_info(account)
+
+        worker = TaskWorker(task)
+        worker.signals.succeeded.connect(on_done)
+        worker.signals.failed.connect(lambda message: on_error(self._humanize(message)))
         self._thread_pool.start(worker)
 
     def _on_playback_finished(
