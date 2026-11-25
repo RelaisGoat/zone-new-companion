@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -12,13 +13,15 @@ from urllib.parse import parse_qs, urlparse
 
 from zone_new_companion.services.logger_service import logger_service
 
-from PyQt6.QtCore import QThreadPool
+from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal
 
 from zone_new_companion.config import AppConfig, ConfigStore
 from zone_new_companion.models import Credentials, MediaItem, PlaylistCategory, PortalType
 from zone_new_companion.services.base import PortalService
 from zone_new_companion.services.m3u_service import M3UService
 from zone_new_companion.services.ocr_service import OCRService
+from zone_new_companion.services.account_check import MAX_PARALLEL as MAX_PARALLEL_CHECKS
+from zone_new_companion.services.account_check import check_account
 from zone_new_companion.services.fallback import account_label, channel_matcher
 from zone_new_companion.services.playback_monitor import PlaybackSession, Source
 from zone_new_companion.services.stalker_service import StalkerService
@@ -28,6 +31,11 @@ from zone_new_companion.state import StateStore
 from zone_new_companion.workers.task_worker import TaskWorker
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _CheckEmitter(QObject):
+    result = pyqtSignal(object, object, str)
+    done = pyqtSignal()
 
 
 class AppController:
@@ -49,6 +57,7 @@ class AppController:
         self._log_dir = log_dir or (Path.home() / ".zone-new-companion" / "logs")
         self._session: PlaybackSession | None = None
         self._on_playback_progress: Callable[[str], None] | None = None
+        self._check_emitters: set[_CheckEmitter] = set()
 
     @property
     def config(self) -> AppConfig:
@@ -353,9 +362,9 @@ class AppController:
             if backup.portal_type != PortalType.XTREAM:
                 return "unknown", None
             try:
-                info = self._fresh_service(backup).fetch_connection_info(backup)
+                info = check_account(backup)
             except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Secours « %s » injoignable : %s", account_label(backup), self._humanize(str(exc)))
+                LOGGER.warning("Secours « %s » injoignable : %s", account_label(backup), exc)
                 return "invalid", None
             if str(info.get("Status", "")).lower() != "active":
                 LOGGER.warning(
@@ -426,19 +435,33 @@ class AppController:
         self._config_store.save(self._config)
         LOGGER.info("Comptes de secours : %d enregistré(s)", len(accounts))
 
-    def test_backup(
+    def check_backups(
         self,
-        account: Credentials,
-        on_done: Callable[[dict[str, str]], None],
-        on_error: Callable[[str], None],
+        accounts: list[Credentials],
+        on_result: Callable[[Credentials, dict[str, str] | None, str], None],
+        on_done: Callable[[], None],
     ) -> None:
-        def task() -> dict[str, str]:
-            return self._fresh_service(account).fetch_connection_info(account)
+        """Check backup accounts in the background, 6 at a time, one request each."""
+        emitter = _CheckEmitter()
+        emitter.result.connect(on_result)
+        emitter.done.connect(on_done)
+        self._check_emitters.add(emitter)
 
-        worker = TaskWorker(task)
-        worker.signals.succeeded.connect(on_done)
-        worker.signals.failed.connect(lambda message: on_error(self._humanize(message)))
-        self._thread_pool.start(worker)
+        def work() -> None:
+            try:
+                with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CHECKS, max(1, len(accounts)))) as pool:
+                    futures = {pool.submit(check_account, account): account for account in accounts}
+                    for future in as_completed(futures):
+                        account = futures[future]
+                        try:
+                            emitter.result.emit(account, future.result(), "")
+                        except Exception as exc:  # noqa: BLE001
+                            emitter.result.emit(account, None, str(exc))
+            finally:
+                emitter.done.emit()
+
+        threading.Thread(target=work, name="backup-check", daemon=True).start()
+        emitter.done.connect(lambda: self._check_emitters.discard(emitter))
 
     def _on_playback_finished(
         self,

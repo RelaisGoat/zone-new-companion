@@ -75,5 +75,7 @@ def install_log_bus() -> None:
     if not any(isinstance(handler, _BusHandler) for handler in root.handlers):
         root.addHandler(_BusHandler(log_bus))
     # Keep third-party chatter out of the journal.
+    # urllib3 logs every internal retry as a warning (e.g. the https fallback on an
+    # http-only server); the app reports real failures itself.
     for noisy in ("urllib3", "requests", "PIL"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+        logging.getLogger(noisy).setLevel(logging.ERROR)

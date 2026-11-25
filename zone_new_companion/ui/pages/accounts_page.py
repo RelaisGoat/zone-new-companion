@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QFrame,
@@ -22,9 +22,6 @@ from zone_new_companion.models import Credentials, PortalType
 from zone_new_companion.services.link_parser import parse_link
 from zone_new_companion.ui import theme
 from zone_new_companion.ui.widgets.common import button, card, label
-
-REFRESH_EVERY_MS = 60_000
-
 
 def account_key(account: Credentials) -> str:
     return f"{account.portal_type.value}|{account.base_url.lower()}|{account.username}"
@@ -108,9 +105,9 @@ class AccountsPage(QWidget):
         header.addStretch(1)
         self.last_check = label("", "Faint")
         header.addWidget(self.last_check)
-        refresh = button("↻  Tout vérifier", tooltip="Interroge chaque compte (ne lance aucune chaîne)")
-        refresh.clicked.connect(self.check_all)
-        header.addWidget(refresh)
+        self.refresh_button = button("↻  Tout vérifier", tooltip="Interroge chaque compte (ne lance aucune chaîne)")
+        self.refresh_button.clicked.connect(self.check_all)
+        header.addWidget(self.refresh_button)
         self.clear_button = button("Tout retirer", tooltip="Supprimer tous les comptes de secours")
         self.clear_button.clicked.connect(self._remove_all)
         header.addWidget(self.clear_button)
@@ -158,20 +155,8 @@ class AccountsPage(QWidget):
         root.addWidget(add_card)
         root.addStretch(1)
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(REFRESH_EVERY_MS)
-        self._timer.timeout.connect(self.check_all)
+        self._checking = False
         self._preview()
-
-    # ----------------------------------------------------------- lifecycle
-    def showEvent(self, event) -> None:  # noqa: N802
-        super().showEvent(event)
-        self.check_all()
-        self._timer.start()
-
-    def hideEvent(self, event) -> None:  # noqa: N802
-        super().hideEvent(event)
-        self._timer.stop()
 
     # -------------------------------------------------------------- public
     def set_accounts(self, accounts: list[Credentials]) -> None:
@@ -179,8 +164,11 @@ class AccountsPage(QWidget):
         self._render()
 
     def check_all(self) -> None:
-        if not self._accounts:
+        if not self._accounts or self._checking:
             return
+        self._checking = True
+        self.refresh_button.setEnabled(False)
+        self.refresh_button.setText("Vérification…")
         for account in self._accounts:
             key = account_key(account)
             state, cons, detail, checked = self._status.get(key, ("", "", "", ""))
@@ -218,8 +206,13 @@ class AccountsPage(QWidget):
                     "": "identifiants refusés",
                 }.get(status, status)
             self._status[key] = (state, cons, detail, now)
-        self.last_check.setText(f"Vérifié à {now} · auto toutes les minutes")
+        self.last_check.setText(f"Vérifié à {now}")
         self._render()
+
+    def checking_done(self) -> None:
+        self._checking = False
+        self.refresh_button.setEnabled(True)
+        self.refresh_button.setText("↻  Tout vérifier")
 
     # ------------------------------------------------------------- editing
     def _preview(self) -> None:

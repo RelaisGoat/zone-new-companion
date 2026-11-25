@@ -105,16 +105,16 @@ def run() -> None:
     accounts_page = window.accounts_page
 
     def check_accounts(accounts: list) -> None:
-        for account in accounts:
-            controller.test_backup(
-                account,
-                on_done=lambda info, a=account: accounts_page.set_status(a, info),
-                on_error=lambda message, a=account: accounts_page.set_status(a, None, message),
-            )
+        controller.check_backups(
+            accounts,
+            on_result=lambda account, info, error: accounts_page.set_status(account, info, error),
+            on_done=accounts_page.checking_done,
+        )
 
     accounts_page.accounts_changed.connect(controller.set_backup_accounts)
     accounts_page.check_requested.connect(check_accounts)
     accounts_page.set_accounts(controller.backup_accounts())
+    accounts_page.check_all()  # once at start-up; then only on demand
 
     for page in window.browser_pages.values():
         page.category_selected.connect(
