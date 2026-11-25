@@ -416,12 +416,21 @@ class AppController:
             LOGGER.info("Ordre de bascule : %s", summary or "aucun compte de secours valide")
             return [(backup, free) for backup, _state, free in ranked]
 
+        planned_at = 0.0
+        tried: set[str] = set()
+
         def next_source() -> Source | None:
-            nonlocal remaining
-            if remaining is None:
-                remaining = plan()
+            nonlocal remaining, planned_at
+            # A plan older than a minute (e.g. a cut 20 min into the match) is re-made so the
+            # connection counts are fresh; accounts already tried in this round are left out.
+            if remaining is None or time.monotonic() - planned_at > 60:
+                if remaining is not None:
+                    tried.clear()
+                remaining = [row for row in plan() if self._backup_key(row[0]) not in tried]
+                planned_at = time.monotonic()
             while remaining:
                 backup, line_was_free = remaining.pop(0)
+                tried.add(self._backup_key(backup))
                 label = account_label(backup)
                 try:
                     resolution = channel_matcher.resolve(profile, item, backup)
