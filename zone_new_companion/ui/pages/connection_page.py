@@ -114,6 +114,10 @@ class ConnectionPage(QWidget):
         bottom = QHBoxLayout()
         self.form_error = label("", "Error", wrap=True)
         bottom.addWidget(self.form_error, 1)
+        self.logout_button = button("Se déconnecter", tooltip="Fermer la session en cours")
+        self.logout_button.clicked.connect(self.disconnect_requested.emit)
+        self.logout_button.hide()
+        bottom.addWidget(self.logout_button)
         self.connect_button = button("Se connecter", "Primary")
         self.connect_button.clicked.connect(self._emit_connect)
         bottom.addWidget(self.connect_button)
@@ -216,10 +220,7 @@ class ConnectionPage(QWidget):
         header.addStretch(1)
         self.refresh_button = button("↻  Rafraîchir", tooltip="Relire les infos du compte (connexions actives…)")
         self.refresh_button.clicked.connect(self.refresh_requested.emit)
-        self.disconnect_button = button("Se déconnecter", "Ghost")
-        self.disconnect_button.clicked.connect(self.disconnect_requested.emit)
         header.addWidget(self.refresh_button)
-        header.addWidget(self.disconnect_button)
         layout.addLayout(header)
         self.account_hint = label("", "Faint", wrap=True)
         layout.addWidget(self.account_hint)
@@ -315,7 +316,10 @@ class ConnectionPage(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self.connect_button.setEnabled(not busy)
-        self.connect_button.setText("Connexion…" if busy else "Se connecter")
+        if busy:
+            self.connect_button.setText("Connexion…")
+        elif self.connect_button.text() == "Connexion…":
+            self.connect_button.setText("Changer de compte" if self.logout_button.isVisible() else "Se connecter")
         self.refresh_button.setEnabled(not busy)
 
     def populate(self, credentials: Credentials) -> None:
@@ -375,7 +379,10 @@ class ConnectionPage(QWidget):
 
     # --------------------------------------------------------------- account
     def set_account(self, profile: Credentials | None, info: dict[str, str]) -> None:
-        if profile is None or not info:
+        connected = profile is not None and bool(info)
+        self.logout_button.setVisible(connected)
+        self.connect_button.setText("Changer de compte" if connected else "Se connecter")
+        if not connected:
             self.account_card.hide()
             return
         self.account_card.show()

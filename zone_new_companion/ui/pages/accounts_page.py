@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QInputDialog,
+    QMessageBox,
     QPlainTextEdit,
     QScrollArea,
     QVBoxLayout,
@@ -110,6 +111,9 @@ class AccountsPage(QWidget):
         refresh = button("↻  Tout vérifier", tooltip="Interroge chaque compte (ne lance aucune chaîne)")
         refresh.clicked.connect(self.check_all)
         header.addWidget(refresh)
+        self.clear_button = button("Tout retirer", tooltip="Supprimer tous les comptes de secours")
+        self.clear_button.clicked.connect(self._remove_all)
+        header.addWidget(self.clear_button)
         list_layout.addLayout(header)
         self.rows = QVBoxLayout()
         self.rows.setSpacing(6)
@@ -266,6 +270,23 @@ class AccountsPage(QWidget):
             self._render()
             self.accounts_changed.emit(list(self._accounts))
 
+    def _remove_all(self) -> None:
+        if not self._accounts:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Tout retirer",
+            f"Retirer les {len(self._accounts)} comptes de secours ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._accounts.clear()
+        self._status.clear()
+        self._render()
+        self.accounts_changed.emit([])
+
     def _rename(self, index: int) -> None:
         if not 0 <= index < len(self._accounts):
             return
@@ -289,6 +310,7 @@ class AccountsPage(QWidget):
                 counts[state] += 1
             self.rows.addWidget(self._row(index, account, state, cons, detail))
         self.empty.setVisible(not self._accounts)
+        self.clear_button.setEnabled(bool(self._accounts))
         parts = []
         if counts["ok"]:
             parts.append(f"{counts['ok']} libre(s)")
