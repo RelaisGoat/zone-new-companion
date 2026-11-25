@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,18 @@ from zone_new_companion.workers.task_worker import TaskWorker
 LOGGER = logging.getLogger(__name__)
 
 
+def classify_backup(info: dict[str, str]) -> tuple[str, bool | None]:
+    """('invalid'|'free'|'full'|'unknown', line_was_free) from an account check."""
+    if info.get("Type") == "M3U Playlist":
+        return "unknown", None
+    if str(info.get("Status", "")).lower() != "active":
+        return "invalid", None
+    active, _, maximum = str(info.get("Active/Max Connections", "")).partition("/")
+    if active.isdigit() and maximum.isdigit():
+        return ("full", False) if int(active) >= int(maximum) else ("free", True)
+    return "unknown", None
+
+
 class _CheckEmitter(QObject):
     result = pyqtSignal(object, object, str)
     done = pyqtSignal()
@@ -58,6 +71,7 @@ class AppController:
         self._session: PlaybackSession | None = None
         self._on_playback_progress: Callable[[str], None] | None = None
         self._check_emitters: set[_CheckEmitter] = set()
+        self._backup_states: dict[str, tuple[float, str, bool | None]] = {}
 
     @property
     def config(self) -> AppConfig:
@@ -364,24 +378,34 @@ class AppController:
             try:
                 info = check_account(backup)
             except Exception as exc:  # noqa: BLE001
+                self._remember_backup_state(backup, "invalid", None)
                 LOGGER.warning("Secours « %s » injoignable : %s", account_label(backup), exc)
                 return "invalid", None
-            if str(info.get("Status", "")).lower() != "active":
+            state, free = classify_backup(info)
+            self._remember_backup_state(backup, state, free)
+            if state == "invalid":
                 LOGGER.warning(
                     "Secours « %s » ignoré : statut %s", account_label(backup), info.get("Status", "inconnu"),
                 )
-                return "invalid", None
-            active, _, maximum = str(info.get("Active/Max Connections", "")).partition("/")
-            if active.isdigit() and maximum.isdigit():
-                return ("full", False) if int(active) >= int(maximum) else ("free", True)
-            return "unknown", None
+            return state, free
 
         def plan() -> list[tuple[Credentials, bool | None]]:
-            with ThreadPoolExecutor(max_workers=min(8, len(backups))) as pool:
-                states = list(pool.map(check, backups))
+            # Accounts that failed at the last check (start-up, « Tout vérifier » or a previous
+            # fallback) are skipped straight away instead of waiting for them to time out again.
+            known_bad = [b for b in backups if self._recent_backup_state(b) == "invalid"]
+            to_check = [b for b in backups if b not in known_bad]
+            if known_bad:
+                LOGGER.info(
+                    "%d compte(s) de secours ignoré(s) sans réessayer : en échec à la dernière vérification",
+                    len(known_bad),
+                )
+            states: list[tuple[str, bool | None]] = []
+            if to_check:
+                with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_CHECKS, len(to_check))) as pool:
+                    states = list(pool.map(check, to_check))
             order = {"free": 0, "unknown": 1, "full": 2}
             ranked = sorted(
-                ((backup, state, free) for backup, (state, free) in zip(backups, states) if state != "invalid"),
+                ((backup, state, free) for backup, (state, free) in zip(to_check, states) if state != "invalid"),
                 key=lambda row: order[row[1]],
             )
             summary = ", ".join(
@@ -435,6 +459,21 @@ class AppController:
         self._config_store.save(self._config)
         LOGGER.info("Comptes de secours : %d enregistré(s)", len(accounts))
 
+    BACKUP_STATE_TTL_S = 20 * 60
+
+    @staticmethod
+    def _backup_key(account: Credentials) -> str:
+        return f"{account.portal_type.value}|{account.base_url.lower()}|{account.username}"
+
+    def _remember_backup_state(self, account: Credentials, state: str, free: bool | None) -> None:
+        self._backup_states[self._backup_key(account)] = (time.monotonic(), state, free)
+
+    def _recent_backup_state(self, account: Credentials) -> str:
+        entry = self._backup_states.get(self._backup_key(account))
+        if entry is None or time.monotonic() - entry[0] > self.BACKUP_STATE_TTL_S:
+            return ""
+        return entry[1]
+
     def check_backups(
         self,
         accounts: list[Credentials],
@@ -454,8 +493,11 @@ class AppController:
                     for future in as_completed(futures):
                         account = futures[future]
                         try:
-                            emitter.result.emit(account, future.result(), "")
+                            info = future.result()
+                            self._remember_backup_state(account, *classify_backup(info))
+                            emitter.result.emit(account, info, "")
                         except Exception as exc:  # noqa: BLE001
+                            self._remember_backup_state(account, "invalid", None)
                             emitter.result.emit(account, None, str(exc))
             finally:
                 emitter.done.emit()
