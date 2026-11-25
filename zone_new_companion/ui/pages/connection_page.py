@@ -6,7 +6,6 @@ from datetime import datetime
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame,
     QGridLayout,
     QHBoxLayout,
     QLineEdit,
@@ -21,7 +20,7 @@ from PyQt6.QtWidgets import (
 from zone_new_companion.models import Credentials, PortalType
 from zone_new_companion.services.link_parser import parse_link
 from zone_new_companion.ui import theme
-from zone_new_companion.ui.widgets.common import SegmentBar, Tile, button, card, divider, label
+from zone_new_companion.ui.widgets.common import SegmentBar, Tile, button, card, label
 
 _INFO_LABELS = {
     "Status": "Statut",
@@ -55,15 +54,11 @@ class ConnectionPage(QWidget):
     refresh_requested = pyqtSignal()
     disconnect_requested = pyqtSignal()
     history_clear_requested = pyqtSignal()
-    backups_changed = pyqtSignal(list)
-    backup_test_requested = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("Page")
         self._history: list[Credentials] = []
-        self._backups: list[Credentials] = []
-        self._backup_status: dict[int, tuple[str, str | None]] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -97,7 +92,6 @@ class ConnectionPage(QWidget):
         right = QVBoxLayout()
         right.setSpacing(22)
         right.addWidget(self._build_history_card())
-        right.addWidget(self._build_backup_card())
         right.addStretch(1)
         columns.addLayout(right, 2)
 
@@ -257,132 +251,6 @@ class ConnectionPage(QWidget):
         layout.addWidget(self.history_empty)
         frame.setMinimumWidth(300)
         return frame
-
-    def _build_backup_card(self):
-        frame, layout = card(18, 10)
-        layout.addWidget(label("Comptes de secours", "SectionTitle"))
-        layout.addWidget(
-            label(
-                "Si une chaîne refuse de passer sur ton compte, l'appli la relance sur ces comptes, dans l'ordre. "
-                "Même serveur : même numéro de chaîne. Autre serveur : retrouvée par son identifiant EPG ou son nom.",
-                "Faint",
-                wrap=True,
-            ),
-        )
-        self.backup_rows = QVBoxLayout()
-        self.backup_rows.setSpacing(6)
-        layout.addLayout(self.backup_rows)
-        self.backup_empty = label("Aucun compte de secours.", "Muted")
-        layout.addWidget(self.backup_empty)
-        layout.addWidget(divider())
-        self.backup_link = QLineEdit()
-        self.backup_link.setPlaceholderText("Lien du compte (get.php, lien de chaîne…)")
-        self.backup_link.setClearButtonEnabled(True)
-        self.backup_link.textChanged.connect(self._on_backup_link_changed)
-        layout.addWidget(self.backup_link)
-        row = QHBoxLayout()
-        self.backup_name = QLineEdit()
-        self.backup_name.setPlaceholderText("Nom (ex. Paul)")
-        row.addWidget(self.backup_name, 1)
-        self.backup_add = button("Ajouter")
-        self.backup_add.clicked.connect(self._add_backup)
-        self.backup_link.returnPressed.connect(self._add_backup)
-        self.backup_name.returnPressed.connect(self._add_backup)
-        row.addWidget(self.backup_add)
-        layout.addLayout(row)
-        self.backup_detect = label("", "Faint", wrap=True)
-        self.backup_detect.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self.backup_detect)
-        frame.setMinimumWidth(300)
-        return frame
-
-    def _on_backup_link_changed(self, text: str) -> None:
-        parsed = parse_link(text)
-        if not text.strip():
-            self.backup_detect.setText("")
-        elif not parsed.ok:
-            self.backup_detect.setText(f"<span style='color:{theme.ERROR}'>✖ {parsed.error}</span>")
-        elif parsed.portal_type == PortalType.STALKER:
-            self.backup_detect.setText(f"<span style='color:{theme.WARN}'>Les portails Stalker ne peuvent pas servir de secours.</span>")
-        else:
-            who = f" · {parsed.username}" if parsed.username else ""
-            where = parsed.base_url or parsed.playlist_url
-            self.backup_detect.setText(f"<span style='color:{theme.OK}'>✔ {parsed.description}</span> · {where}{who}")
-
-    def _add_backup(self) -> None:
-        parsed = parse_link(self.backup_link.text())
-        if not parsed.ok or parsed.portal_type == PortalType.STALKER:
-            self._on_backup_link_changed(self.backup_link.text() or " ")
-            return
-        account = parsed.to_credentials()
-        account.name = self.backup_name.text().strip()
-        self._backups.append(account)
-        self.backup_link.clear()
-        self.backup_name.clear()
-        self._backup_status.clear()
-        self._render_backups()
-        self.backups_changed.emit(list(self._backups))
-        self.backup_test_requested.emit(len(self._backups) - 1)
-
-    def _move_backup(self, index: int, delta: int) -> None:
-        target = index + delta
-        if 0 <= target < len(self._backups):
-            self._backups[index], self._backups[target] = self._backups[target], self._backups[index]
-            self._backup_status.clear()
-            self._render_backups()
-            self.backups_changed.emit(list(self._backups))
-
-    def _remove_backup(self, index: int) -> None:
-        if 0 <= index < len(self._backups):
-            del self._backups[index]
-            self._backup_status.clear()
-            self._render_backups()
-            self.backups_changed.emit(list(self._backups))
-
-    def set_backups(self, accounts: list[Credentials]) -> None:
-        self._backups = list(accounts)
-        self._backup_status.clear()
-        self._render_backups()
-
-    def set_backup_status(self, index: int, text: str, color: str | None = None) -> None:
-        self._backup_status[index] = (text, color)
-        self._render_backups()
-
-    def _render_backups(self) -> None:
-        while self.backup_rows.count():
-            child = self.backup_rows.takeAt(0).widget()
-            if child is not None:
-                child.deleteLater()
-        for index, account in enumerate(self._backups):
-            row = QFrame()
-            row.setObjectName("Tile")
-            line = QHBoxLayout(row)
-            line.setContentsMargins(12, 8, 8, 8)
-            line.setSpacing(4)
-            texts = QVBoxLayout()
-            texts.setSpacing(1)
-            host = account.base_url.split("://", 1)[-1].split("/", 1)[0]
-            title = account.name or account.username or host
-            texts.addWidget(label(f"{index + 1}. {title}", "SectionTitle"))
-            texts.addWidget(label(f"{account.portal_type.value.upper()} · {account.username or 'playlist'} · {host}", "Faint"))
-            status, color = self._backup_status.get(index, ("", None))
-            if status:
-                status_label = label(status, "Faint", wrap=True)
-                if color:
-                    status_label.setStyleSheet(f"color: {color};")
-                texts.addWidget(status_label)
-            line.addLayout(texts, 1)
-            for text, tip, handler in (
-                ("↑", "Monter", lambda _=False, i=index: self._move_backup(i, -1)),
-                ("↓", "Descendre", lambda _=False, i=index: self._move_backup(i, 1)),
-                ("Tester", "Vérifier le compte (statut, connexions)", lambda _=False, i=index: self.backup_test_requested.emit(i)),
-                ("✕", "Retirer", lambda _=False, i=index: self._remove_backup(i)),
-            ):
-                btn = button(text, "Ghost", tip)
-                btn.clicked.connect(handler)
-                line.addWidget(btn)
-            self.backup_rows.addWidget(row)
-        self.backup_empty.setVisible(not self._backups)
 
     # ------------------------------------------------------------- link mode
     def _on_link_changed(self, text: str) -> None:

@@ -21,17 +21,19 @@ from zone_new_companion.services.log_bus import LogBus, LogEntry
 from zone_new_companion.state import AppState
 from zone_new_companion.ui import theme
 from zone_new_companion.ui.media_view import LogoLoader
+from zone_new_companion.ui.pages.accounts_page import AccountsPage
 from zone_new_companion.ui.pages.browser_page import BrowserPage
 from zone_new_companion.ui.pages.connection_page import ConnectionPage
 from zone_new_companion.ui.pages.journal_page import JournalPage
 from zone_new_companion.ui.widgets.common import Toast, button, label
 
-PAGE_CONNECTION, PAGE_LIVE, PAGE_MOVIES, PAGE_SERIES, PAGE_JOURNAL = range(5)
+PAGE_CONNECTION, PAGE_LIVE, PAGE_MOVIES, PAGE_SERIES, PAGE_ACCOUNTS, PAGE_JOURNAL = range(6)
 _NAV = [
     ("◉   Connexion", PAGE_CONNECTION),
     ("▶   Chaînes", PAGE_LIVE),
     ("◼   Films", PAGE_MOVIES),
     ("❏   Séries", PAGE_SERIES),
+    ("⇄   Secours", PAGE_ACCOUNTS),
     ("≡   Journal", PAGE_JOURNAL),
 ]
 
@@ -118,12 +120,14 @@ class MainWindow(QMainWindow):
             "Movies": BrowserPage("Movies", self.logo_loader),
             "Series": BrowserPage("Series", self.logo_loader),
         }
+        self.accounts_page = AccountsPage()
         self.journal_page = JournalPage(bus, app_data / "logs", retries)
         for widget in (
             self.connection_page,
             self.browser_pages["Live"],
             self.browser_pages["Movies"],
             self.browser_pages["Series"],
+            self.accounts_page,
             self.journal_page,
         ):
             self.stack.addWidget(widget)

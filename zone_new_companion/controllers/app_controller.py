@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -345,11 +346,48 @@ class AppController:
         ]
         if not backups:
             return None
-        remaining = list(backups)
+        remaining: list[tuple[Credentials, bool | None]] | None = None
+
+        def check(backup: Credentials) -> tuple[str, bool | None]:
+            """('invalid'|'free'|'full'|'unknown', line_was_free)."""
+            if backup.portal_type != PortalType.XTREAM:
+                return "unknown", None
+            try:
+                info = self._fresh_service(backup).fetch_connection_info(backup)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Secours « %s » injoignable : %s", account_label(backup), self._humanize(str(exc)))
+                return "invalid", None
+            if str(info.get("Status", "")).lower() != "active":
+                LOGGER.warning(
+                    "Secours « %s » ignoré : statut %s", account_label(backup), info.get("Status", "inconnu"),
+                )
+                return "invalid", None
+            active, _, maximum = str(info.get("Active/Max Connections", "")).partition("/")
+            if active.isdigit() and maximum.isdigit():
+                return ("full", False) if int(active) >= int(maximum) else ("free", True)
+            return "unknown", None
+
+        def plan() -> list[tuple[Credentials, bool | None]]:
+            with ThreadPoolExecutor(max_workers=min(8, len(backups))) as pool:
+                states = list(pool.map(check, backups))
+            order = {"free": 0, "unknown": 1, "full": 2}
+            ranked = sorted(
+                ((backup, state, free) for backup, (state, free) in zip(backups, states) if state != "invalid"),
+                key=lambda row: order[row[1]],
+            )
+            summary = ", ".join(
+                f"{account_label(b)} ({ {'free': 'libre', 'full': 'occupé', 'unknown': '?'}[state] })"
+                for b, state, _free in ranked
+            )
+            LOGGER.info("Ordre de bascule : %s", summary or "aucun compte de secours valide")
+            return [(backup, free) for backup, _state, free in ranked]
 
         def next_source() -> Source | None:
+            nonlocal remaining
+            if remaining is None:
+                remaining = plan()
             while remaining:
-                backup = remaining.pop(0)
+                backup, line_was_free = remaining.pop(0)
                 label = account_label(backup)
                 try:
                     resolution = channel_matcher.resolve(profile, item, backup)
@@ -359,24 +397,14 @@ class AppController:
                 if resolution is None:
                     LOGGER.warning("« %s » introuvable sur le compte de secours « %s »", item.name, label)
                     continue
-                line_was_free: bool | None = None
                 backup_service = self._fresh_service(backup)
-                if backup.portal_type == PortalType.XTREAM and backup_service is not None:
-                    try:
-                        cons = backup_service.fetch_connection_info(backup).get("Active/Max Connections", "")
-                        active, _, maximum = cons.partition("/")
-                        if active.isdigit() and maximum.isdigit():
-                            line_was_free = int(active) < int(maximum)
-                            LOGGER.info("Ligne de secours « %s » : %s connexions", label, cons)
-                    except Exception as exc:  # noqa: BLE001
-                        LOGGER.warning("État de la ligne « %s » illisible : %s", label, self._humanize(str(exc)))
                 return Source(
                     label=label,
                     url=resolution.url,
                     line_was_free=line_was_free,
                     before_retry=(
                         (lambda b=backup, svc=backup_service: svc.fetch_connection_info(b))
-                        if backup_service is not None and backup.portal_type == PortalType.XTREAM
+                        if backup.portal_type == PortalType.XTREAM
                         else None
                     ),
                     note=resolution.method,
