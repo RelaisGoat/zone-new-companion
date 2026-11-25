@@ -284,7 +284,8 @@ class AppController:
             on_error("Pas de connexion active.")
             return
         if self._session is not None:
-            self._session.cancel()  # stop watching the previous launch (VLC stays open)
+            # Close the previous VLC: on a 1-connection line it would make the new one fail (401).
+            self._session.cancel(close_player=True)
 
         self._state_store.update(status_text=f"Préparation de {item.name}…")
         if self._on_playback_progress is not None:

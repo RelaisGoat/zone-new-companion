@@ -58,6 +58,17 @@ _PICTURE = "Received first picture"
 _DEAD = ("dead input", "Your input can't be opened", "nothing to play")
 
 
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min {seconds:02d}"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes:02d}"
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -132,13 +143,18 @@ class PlaybackSession(QObject):
         self._status.trust_env = False  # never send localhost polling through a proxy
         self._cancelled = threading.Event()
         self._process: subprocess.Popen | None = None
+        self._port = 0
+        self._password = ""
 
     # ------------------------------------------------------------------ API
     def start(self) -> None:
         threading.Thread(target=self._run, name="vlc-monitor", daemon=True).start()
 
-    def cancel(self) -> None:
+    def cancel(self, close_player: bool = False) -> None:
+        """Stop watching. With close_player, also close this session's VLC (frees the connection)."""
         self._cancelled.set()
+        if close_player:
+            threading.Thread(target=self._stop_process, daemon=True).start()
 
     # ------------------------------------------------------------ internals
     def _log(self, level: int, message: str) -> None:
@@ -173,6 +189,7 @@ class PlaybackSession(QObject):
             if last.ok:
                 where = "" if first else f" (via « {source.label} »)"
                 self.finished.emit(True, f"{self._title} : lecture en cours{where}")
+                self._supervise()
                 return
             if last.idle:
                 # VLC closed by the user, or a new channel was requested: stop quietly.
@@ -256,6 +273,7 @@ class PlaybackSession(QObject):
 
         self.progress.emit(f"Connexion à {_host(self._url)}… (essai {attempt}/{attempts})")
         self._log(logging.INFO, f"Essai {attempt}/{attempts} : VLC lancé (PID {self._process.pid})")
+        self._port, self._password = port, password
         result = self._watch(log_file, port, password)
         self._prune_logs()
         return result
@@ -430,6 +448,132 @@ class PlaybackSession(QObject):
             )
         return AttemptResult(True, "lecture (non confirmée)", codes)
 
+    # ------------------------------------------------------- after "it plays"
+    STALL_S = 15.0
+    MAX_RECOVERIES = 5
+    RECOVERY_WINDOW_S = 15 * 60
+
+    @staticmethod
+    def _bytes(status: dict) -> int:
+        stats = status.get("stats") or {}
+        for key in ("demuxreadbytes", "readbytes"):
+            try:
+                value = int(stats.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value:
+                return value
+        return 0
+
+    def _supervise(self) -> None:
+        """Keep an eye on VLC while it plays: detect cuts and stalls, then resume or fall back."""
+        if not self._port:
+            return
+        started = time.monotonic()
+        last_bytes = -1
+        last_progress = time.monotonic()
+        misses = 0
+        recoveries: list[float] = []
+        while not self._cancelled.wait(2.0):
+            process = self._process
+            if process is not None and process.poll() is not None:
+                self._log(logging.INFO, f"VLC fermé après {_duration(time.monotonic() - started)} de lecture")
+                return
+            status = self._poll_status(self._port, self._password)
+            if status is None:
+                misses += 1
+                if misses >= 5:
+                    self._log(logging.INFO, "Interface de VLC injoignable : surveillance de la lecture arrêtée")
+                    return
+                continue
+            misses = 0
+            state = str(status.get("state", ""))
+            now = time.monotonic()
+            current = self._bytes(status)
+            if state == "paused":
+                last_progress = now
+                continue
+            if current > last_bytes:
+                last_bytes = current
+                last_progress = now
+            reason = ""
+            if state == "stopped":
+                reason = "le flux s'est arrêté (connexion coupée par le serveur)"
+            elif last_bytes > 0 and now - last_progress > self.STALL_S:
+                reason = f"plus aucune donnée reçue depuis {self.STALL_S:.0f} s"
+            if not reason:
+                continue
+            self._log(logging.WARNING, f"⚠ Lecture coupée après {_duration(now - started)} : {reason}")
+            recoveries = [t for t in recoveries if now - t < self.RECOVERY_WINDOW_S]
+            if len(recoveries) >= self.MAX_RECOVERIES:
+                self._log(
+                    logging.ERROR,
+                    f"✖ Trop de coupures ({self.MAX_RECOVERIES} en {self.RECOVERY_WINDOW_S // 60} min) : j'arrête de relancer",
+                )
+                self.progress.emit(f"{self._title} : trop de coupures, relance abandonnée")
+                return
+            recoveries.append(now)
+            self.progress.emit(f"{self._title} : coupure, relance…")
+            if not self._recover():
+                return
+            started = time.monotonic()
+            last_bytes = -1
+            last_progress = time.monotonic()
+
+    def _recover(self) -> bool:
+        """Same account first, then the backups, inside the same VLC window."""
+        self._log(logging.INFO, f"Relance sur le même compte « {self._source.label} »")
+        if self._replay(self._url):
+            self._log(logging.INFO, "✔ Lecture reprise")
+            self.progress.emit(f"{self._title} : lecture reprise")
+            return True
+        self._log(logging.WARNING, f"Pas de reprise sur « {self._source.label} » en 20 s")
+        while self._next_source is not None and not self._cancelled.is_set():
+            try:
+                source = self._next_source()
+            except Exception as exc:  # noqa: BLE001
+                self._log(logging.WARNING, f"Compte de secours inutilisable : {exc}")
+                source = None
+            if source is None:
+                break
+            self._log(logging.INFO, f"⇄ Bascule sur le compte « {source.label} » ({source.note})")
+            self.progress.emit(f"Bascule sur « {source.label} »…")
+            if self._replay(source.url):
+                self._source, self._url, self._line_was_free = source, source.url, source.line_was_free
+                self._log(logging.INFO, f"✔ Lecture reprise via « {source.label} »")
+                self.progress.emit(f"{self._title} : reprise via « {source.label} »")
+                return True
+            self._log(logging.WARNING, f"Échec sur « {source.label} »")
+        self._log(logging.ERROR, f"✖ {self._title} : impossible de reprendre la lecture")
+        self.progress.emit(f"{self._title} : impossible de reprendre la lecture")
+        return False
+
+    def _replay(self, url: str, timeout_s: float = 20.0) -> bool:
+        """Ask the running VLC to play url and wait until data flows again."""
+        self._command(self._port, self._password, "in_play", input=url)
+        deadline = time.monotonic() + timeout_s
+        began = time.monotonic()
+        baseline = -1
+        growth = 0
+        while time.monotonic() < deadline and not self._cancelled.wait(1.0):
+            process = self._process
+            if process is not None and process.poll() is not None:
+                return False
+            status = self._poll_status(self._port, self._password)
+            if status is None:
+                continue
+            state = str(status.get("state", ""))
+            current = self._bytes(status)
+            if state == "playing" and current > 0:
+                if baseline >= 0 and current > baseline:
+                    growth += 1
+                    if growth >= 2:
+                        return True
+                baseline = current
+            elif state == "stopped" and time.monotonic() - began > 4:
+                return False
+        return False
+
     def _poll_status(self, port: int, password: str) -> dict | None:
         try:
             response = self._status.get(
@@ -444,11 +588,11 @@ class PlaybackSession(QObject):
         except (requests.RequestException, ValueError):
             return None
 
-    def _command(self, port: int, password: str, command: str) -> None:
+    def _command(self, port: int, password: str, command: str, **extra: str) -> None:
         try:
             self._status.get(
                 f"http://127.0.0.1:{port}/requests/status.json",
-                params={"command": command},
+                params={"command": command, **extra},
                 auth=("", password),
                 timeout=1.0,
             )
