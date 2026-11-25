@@ -76,8 +76,8 @@ def _host(url: str) -> str:
 class AttemptResult:
     ok: bool
     reason: str
-    idle: bool = False  # VLC opened but never tried to read the stream
     codes: list[int] = field(default_factory=list)
+    idle: bool = False  # VLC opened but never tried to read the stream
 
 
 class PlaybackSession(QObject):
@@ -281,7 +281,7 @@ class PlaybackSession(QObject):
         if code == 401 and self._line_was_free:
             return (
                 "refusé alors que la ligne était libre (0 connexion) : le serveur bloque la lecture "
-                "pour ce compte, cette IP ou ce lecteur — pas un problème de limite"
+                "pour ce compte, cette IP ou ce lecteur (probablement pas une question de limite)"
             )
         return explain_http(code)
 
